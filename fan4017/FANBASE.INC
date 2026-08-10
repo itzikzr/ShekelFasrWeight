@@ -1,0 +1,51 @@
+$INCLUDE  (D:\C51V4\ASM\REG52.INC)
+;
+;================================================================
+;
+F1    EQU  PSW.1   ;F1 USER FLAG
+
+    IRPC N, <01234567> ;BANK 0 REGISTER DIRECT ACCESS
+REG&N   EQU  N
+    ENDM
+
+LOOKUP   MACRO TABLE, OFFSET
+    ADD  A, #((TABLE-$)-(OFFSET+3))
+    MOVC A, @A+PC
+    ENDM
+;
+;================================================================
+;
+EXTRN   BIT (FBIT, FPEN, FODD)
+;
+SETPAR   MACRO
+    JNB  FBIT, $ + 14
+    JNB  FPEN, $ + 19
+    MOV  C, P
+    JNB  FODD, $ + 15
+    CPL  C
+    SJMP $+11
+    MOV  C, FODD
+    RLC  A
+    MOV  C, P
+    ORL  C, /FPEN
+    RRC  A
+    SETB C
+    ENDM
+;
+;================================================================
+;
+CALEN   EQU  P1.5 ;CALIBRATION JUMPER
+BCD420   EQU  P1.4 ;4/20MA TRANSMIT BIT
+WD    EQU  P1.7 ;WATCHDOG REFRESH BIT
+SCL    EQU  T0  ;I2C CLOCK
+SDA    EQU  INT0 ;I2C DATA
+PWR    EQU  T1  ;POWER ON, ACTIVE LOW
+NOVRAD   EQU  0A0H ;NOVRAM I2C ADDRESS
+DISPAD   EQU  70H  ;LCD DISPLAY I2C ADDRESS
+ADBASE   EQU  20H  ;A/D I2C BASE ADDRESS
+;
+CLOCKRATE  EQU  12  ;MAIN CLOCK RATE = 1/2400 (11.0592MHZ)
+INSIZE   EQU  32  ;UART INPUT BUFFER SIZE
+LCDSIZE   EQU  6  ;LCD BUFFER SIZE
+PWRTIME   EQU  30  ;POWER ON/OFF DEBOUNCING = PWRTIME/600 SEC
+

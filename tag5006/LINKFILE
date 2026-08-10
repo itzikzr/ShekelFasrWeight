@@ -1,0 +1,23 @@
+tigerr.obj,
+tigerb.obj,
+tigerd.obj,
+tigerc.obj,
+tigeri.obj,
+tigerf.obj,
+tigerk.obj,
+tigerm.obj,
+tigerp.obj,
+tigers.obj,
+tigert.obj,
+tigerw.obj,
+tigerx.obj,
+tigerz.obj,
+lib\tigerl.lib
+to TAG5006
+xdata(?xd?tigerd, ?xd?printf?printf, ?c_lib_xdata,
+_xdata_group_, ?xd?tigeri,?xd?memstart, ?xd?tigerm, ?xd?tigert, 
+?xd?tigerb, ?xd?tigerz)
+pdata(0FF00H)
+ramsize(256)
+precede(?dt?regbank)
+

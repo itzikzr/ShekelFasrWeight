@@ -1,0 +1,315 @@
+
+                        A F U N . A S M
+
+
+ uchar  nada(uchar c)
+ ====================
+        Dummy funtion. Returns its input parameter. Usefull for debugging,
+ to mark breakpoint.
+
+
+ void   watchdog(void)
+ =====================
+        Watchdog function. Needs to be called only when the "atodin"
+ function is not invoked.
+
+
+ void   bell(uchar n)
+ =================
+        Activates the buzzer n times, where n may range from 0 to 7.
+ n =  0:  The buzzer is deactivated.
+ n = 1-5: The buzzer beeps 1-5 times.
+ n = 6:   The buzzer beeps when a key is depressed.
+ n = 7:   The buzzer sounds coutinuously, until the next bell command.
+
+
+ uchar  putchar(uchar c)
+ =======================
+        Basic display output function. Prototype in the compiler's "stdio.h"
+ include file. The ASCII character "c" is displayed at the current cursor
+ position and the cursor is incremented. The function returns its input
+ parameter "c".
+        The cursor may range from 0 to 7. Positions 0 and 1 point both to
+ the leftmost character; position 6 points to the rightmost character, and
+ position 7 is the end-of-line mark. When "putchar" is invoked with the
+ cursor at 7 (end-of-line), the cursor is not incremented, and the "fscroll"
+ flag controls the function's behaviour. If "fscroll" is set, the display
+ scrolls to the left, and the character "c" is printed at the rightmost po-
+ sition. If "fscroll" is clear, nothing is printed.
+        The "c" character is interpreted as follows:
+    0     NULL: the display is not modified, the cursor is not incremented.
+   1-6    Cursor positionning command: the cursor is set to this value, the
+          display is not modified.
+    7     Bell: buzzer sounds for 0.1 second, cursor not incremented.
+   8-0FH  All equivalent to CR of LF: the cursor goes home (cursor = 1), the
+          display is not modified
+ 10H-1FH  All these characters clear the screen, including the 14 display
+          flags. Calling putchar('\0X11'), for example, is the same as
+          calling clrscr().
+ 20H-2DH  Normal ASCII display, if possible (7 segments limitation), or
+          blank. The cursor is incremented.
+   2EH    Decimal period: displayed but the cursor is not incremented.
+ 2FH-5FH  ASCII latinic display (upper case). The cursor is incremented.
+ 60H-79H  ASCII hebrew display, cursor is incremented.
+ 80H-...  NULL characters: ignored.
+
+ uchar  flag(uchar f, uchar p)
+ =============================
+        Handles the 14 display flags. "f" is the flag number (from 0 to 13),
+ and "p" is the new flag's value. The return value is the state of the flag,
+ before the function call; it may be 0 or 1.
+        If "p" is 2 or greater, the flag is not modified, the function still
+ returns the flag's state (test function).
+
+ void   clrscr(void)
+ ===================
+        Clears the screen, including the display flags, and homes the cursor.
+
+ bit    kbhit(void)
+ ==================
+        Similar to the Borland function. It returns true when a key has been
+ depressed, at either the parallel or the serial keyboard. After it returns
+ true, the "getch" function must be called to get the actual depressed key.
+ Unlike the Borland function, it returns false if the depressed key is re-
+ leased before "getch" has been called.
+
+ uint   atodin(void)
+ ===================
+        Samples the A/D converter and returns its 16 bits value, also
+ refreshes the watchdog.
+
+ void   recycle(void)
+ ====================
+        This is a forced jump to test mode. This function may be called from
+ the main program. It is (sometimes) called by the error handler function.
+
+ void   relset(uint n)
+ =====================
+        Fills the relay buffer "relbuf" with the bit pattern defined by the
+ input parameter n: all relay with bits set to 1 will be ON.
+
+
+
+                          K B D . C
+
+
+ uchar  getch(void)
+ ==================
+        Waits for a key to be hit (at any keyboard, parallel or serial), and
+ returns its decoded ASCII value.
+
+ void   ungetch(void)
+ ====================
+        Restore the last character read by "getch", so that the next getch
+ call will return it again. A kbhit call will also return true.
+
+ uchar  keypress(void)
+ =====================
+        Returns the ASCII code of the key being depressed, or 0 if no key
+ is being depressed.
+
+ void   switchoff(void)
+ ======================
+        Switches the indicator off. This function is called by the ON/OFF
+ interrupt handler (INT1).
+
+
+                           I C B U S . C
+
+
+ void   icini(void)
+ ==================
+        I2C bus initialization. Must be called once, at least, at power up.
+
+ bit    open(uchar bus_address, uchar memory_address)
+ ====================================================
+        Opens an I2C device for read/write operation. "bus_address" is the
+ the device's I2C bus address, and "memory_address" is the address to a
+ device's internal register or memory file. A device must be open before it
+ can be read or written into. The function returns a success/fail status.
+
+ void   close(void)
+ ==================
+        Closes ane open device on the I2C bus. All devices must be closed
+ before a new one can be open.
+
+ bit    write(uchar n) small
+ ===========================
+        Transfers n bytes from the "icbuf" buffer to the actually open
+ device. Bytes are written into the device, starting at the memory_address
+ used in the "open" call. The function returns a success/fail status.
+
+ bit    read(uchar address, uchar n) small
+ =========================================
+        Transfers n bytes from the actually open device to the "icbuf"
+ buffer. The "address" must be the device's bus_address from the "open"
+ call. Bytes are read, starting from the memory_address used in the "open"
+ call. The function returns a success/fail status.
+
+
+
+                         N O V R A M . C
+
+
+ bit    novin(uchar *m, uchar p) small
+ =====================================
+        Reads the NOVRAM page p ("isize" bytes) into the memory, starting
+ at address m. If "m" is the NULL pointer, the target destination is the
+ "icbuf" buffer itself. Note that "icbuf" is used anyway for the data
+ transfer operation (see the icbus read/write functions). The NOVRAM page
+ p may range from 0 to 15.
+
+ bit    novout(uchar p, uchar * m) small
+ =======================================
+        Writes "isize" bytes from the memory file pointed to by "m", into
+ the NOVRAM page p. If "m" is the NULL pointer, the "icbuf" buffer itself
+ is taken as the source memory.
+
+
+
+                         C L O C K . C
+
+
+ bit    clockin(uchar *m, uchar p) small
+ =====================================
+        Reads the RTC page p ("isize" bytes) into the memory, starting
+ at address m. If "m" is the NULL pointer, the target destination is the
+ "icbuf" buffer itself. Note that "icbuf" is used anyway for the data
+ transfer operation (see the icbus read/write functions). The RTC page p
+ may range from 0 to 7. Page 0 holds the timing registers. Pages 1 to 7
+ are general purpose RAM bytes.
+
+ bit    clockout(uchar p, uchar * m) small
+ =======================================
+        Writes "isize" bytes from the memory file pointed to by "m", into
+ the RTC page p. If "m" is the NULL pointer, the "icbuf" buffer itself is
+ taken as the source memory.
+
+
+
+                         U A R T . C
+
+
+ void   comini(uchar control) small
+ ==================================
+        Initialize the internal UART with RS232 parameters set according to
+ the control byte "control", which has the following format:
+               XXX  BITS  ODD  P-EN  XXX BR2 BR1 BR0
+   XXX         Unassigned bit
+   BITS        8 bits format if set, 7 bits format if clear.
+   ODD         Odd parity if set, even parity if clear
+   P-EN        Parity bit appended if set. No parity if clear.
+ BR2-BR1-BR0   Baud rate code, ranging from 0 to 7, for the following rates:
+     0         300
+     1         600
+     2         1200
+     3         2400
+     4         4800
+     5         9600
+     6         14400
+     7         19200
+
+ void   xcomini(uchar control) small
+ ===================================
+        Initialize the external UART with RS232 parameters set according to
+ the control byte "control". Same bit definition as for the internal UART,
+ but the baud rate codes are the following:
+     0         300
+     1         600
+     2         1200
+     3         2400
+     4         4800
+     5         9600
+     6         19200
+     7         38400
+
+ void   flush(void) small
+ ========================
+        Flushes the internal UART's input buffer.
+
+ void   xflush(void) small
+ =========================
+        Flushes the external UART's input buffer.
+
+ bit    comstat(void) small
+ ==========================
+        Returns true if the internal UART's input buffer is not empty.
+
+ bit    xcomstat(void) small
+ ===========================
+        Returns true if the external UART's input buffer is not empty.
+
+ uchar  getcom(void) small
+ =========================
+        Waits for a byte reception, at the internal UART, and returns it.
+ If the keyboard is activated before reception, the function returns the
+ the NULL byte.
+
+ uchar  xgetcom(void) small
+ ==========================
+        Waits for a byte reception, at the external UART, and returns it.
+ If the keyboard is activated before reception, the function returns the
+ the NULL byte.
+
+ uchar allstat(void) small
+ =========================
+        Checks the status of all input devices and returns the following
+ value:
+                0 - No input from any device
+                1 - Internl UART input
+                2 - External UART input
+                3 - Keyboard input
+
+ uint    allcom() small
+ ======================
+        Waits for a byte reception at any input device and returns it into
+ the least significant byte of integer return value. The most significant
+ bit is always cleared, assuming that it can be a parity bit. The device
+ number (from the allstat call) is returned into the most significant byte.
+
+ void   comstring(uchar *s) small
+ ================================
+        Sends the ASCIIZ string s through the internal UART.
+
+ void   xcomstring(uchar *s) small
+ ==================================
+        Sends the ASCIIZ string s through the external UART.
+
+ void   binstring(uchar *s, uchar n) small
+ =========================================
+        Sends the n-bytes binary string s, through the internal UART.
+
+ void   xbinstring(uchar *s, uchar n) small
+ ==========================================
+        Sends the n-bytes binary string s, through the external UART.
+
+
+
+                         A T O D . C
+
+
+ void   wait(uchar n)
+ ====================
+        Precise delay function: dead wait time of 5 * (n+2) microseconds.
+ The delay may be longer if a clock interrupt occurs during the wait time.
+
+ bit    trimset(uchar n) small
+ =============================
+        Sets the digital trimmer to the value "n", which may range from 0
+ to 100. Terminates with an A/D calibration cycle. Returns a success/fail
+ status.
+
+ bit    calib(void)
+ ==================
+        Internal A/D calibration cycle. It must be executed at least once,
+ at power up. Note that a "trimset" call also calibrates the A/D. Returns
+ a success/fail status.
+
+ uchar  trimfix(uint n)
+ ======================
+        Attempts to set the digital trimmer so that the A/D reading gets
+ the closest possible value under the target "n". During the process, the
+ successive trial values are displayed. The final trimmer setting is
+ returned as a value ranging from 1 to 99. The value 0 means that the ope-
+ ration failed.
+
