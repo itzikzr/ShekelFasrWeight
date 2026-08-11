@@ -118,6 +118,32 @@ def parse_dini_frame(frame: str):
     return weight, status_str, None
 
 
+_SWAN_TEXT_RE = re.compile(r'^([+\-])([\d.]{7})$')
+
+
+def parse_swan_frame(frame: str):
+    """
+    Swan text — [+/-] ואחריו 7 תווים (ספרות, ואולי נקודה אחת בפנים) ו-CR.
+    לא משנה איפה הנקודה נמצאת (או אם בכלל קיימת) — פשוט קוראים את המספר.
+    דוגמאות: '+000.010' וגם '+0000010' -> 0.010 kg
+    """
+    s = frame.strip("\r\n\x00")
+    m = _SWAN_TEXT_RE.match(s)
+    if not m:
+        return None, "", None
+    sign, body = m.groups()
+    try:
+        if "." in body:
+            weight = float(sign + body)
+        else:
+            weight = int(body) / 1000.0
+            if sign == "-":
+                weight = -weight
+    except ValueError:
+        return None, "", None
+    return weight, "", None
+
+
 def parse_swan_frame_bytes(raw: bytes):
     """
     Swan PC0034 — פריים 18 בייט (ללא CR מוביל ו-LF סוגר):
@@ -222,7 +248,7 @@ class ScaleSampler:
         ttk.Label(self.frm_serial, text="Baud:").grid(row=0, column=3, **pad)
         self.baud_var = tk.StringVar(value="9600")
         ttk.Combobox(self.frm_serial, textvariable=self.baud_var,
-                     values=["600", "1200", "2400", "4800", "9600", "19200", "38400"],
+                     values=["600", "1200", "2400", "4800", "9600", "19200", "38400", "57600", "115200"],
                      width=8, state="readonly").grid(row=0, column=4, **pad)
 
         # ── שמאל: הגדרות TCP ──
@@ -252,7 +278,7 @@ class ScaleSampler:
                         command=self._on_protocol_change).grid(row=0, column=3, sticky="w")
         self.show_each = tk.BooleanVar(value=True)
         ttk.Checkbutton(frm_set, text="הצג כל קריאה",
-                        variable=self.show_each).grid(row=0, column=3, padx=8)
+                        variable=self.show_each).grid(row=0, column=4, padx=8)
 
         self.frm_manual = ttk.Frame(frm_set)
         self.frm_manual.grid(row=1, column=0, columnspan=4, sticky="ew")
@@ -267,6 +293,11 @@ class ScaleSampler:
                         variable=self.auto_var,
                         command=self._on_auto_change).grid(row=2, column=0, columnspan=2,
                                                            sticky="w", padx=8, pady=2)
+        self.live_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm_set, text="שקילה LIVE",
+                        variable=self.live_var,
+                        command=self._on_live_change).grid(row=2, column=2, columnspan=2,
+                                                          sticky="w", padx=8, pady=2)
         self.frm_auto = ttk.Frame(frm_set)
         self.frm_auto.grid(row=3, column=0, columnspan=4, sticky="ew")
         ttk.Label(self.frm_auto, text="סף הפעלה (kg):").grid(row=0, column=0, **pad)
@@ -289,6 +320,9 @@ class ScaleSampler:
         self.btn_disconnect = ttk.Button(frm_btns, text="התנתק",
                                          command=self._disconnect, state="disabled", width=11)
         self.btn_disconnect.pack(side="left", padx=3)
+        self.btn_calib = ttk.Button(frm_btns, text="כיול Swan",
+                                    command=self._open_swan_calib, state="disabled", width=11)
+        self.btn_calib.pack(side="left", padx=3)
         ttk.Button(frm_btns, text="נקה לוג", command=self._clear_log, width=9).pack(side="left", padx=3)
 
         # ── שמאל: תוצאות (מתחת לכפתורים) ──
@@ -352,14 +386,16 @@ class ScaleSampler:
         frm_hist.rowconfigure(0, weight=1)
         frm_hist.columnconfigure(0, weight=1)
 
-        cols = ("מס'", "שעה", "משקל (kg)")
+        cols = ("מס'", "שעה", "משקל (kg)", "קריאות")
         self.history_tree = ttk.Treeview(frm_hist, columns=cols, show="headings")
         self.history_tree.heading("מס'",       text="מס'")
         self.history_tree.heading("שעה",        text="שעה")
         self.history_tree.heading("משקל (kg)", text="משקל (kg)")
+        self.history_tree.heading("קריאות",    text="קריאות")
         self.history_tree.column("מס'",        width=36,  anchor="center", stretch=False)
         self.history_tree.column("שעה",         width=65,  anchor="center", stretch=False)
-        self.history_tree.column("משקל (kg)", width=90,  anchor="e",      stretch=True)
+        self.history_tree.column("משקל (kg)", width=90,  anchor="e",      stretch=False)
+        self.history_tree.column("קריאות",     width=55,  anchor="center", stretch=True)
 
         sb_hist = ttk.Scrollbar(frm_hist, orient="vertical",
                                  command=self.history_tree.yview)
@@ -379,8 +415,12 @@ class ScaleSampler:
     def _on_mode_change(self):
         proto = self.protocol_var.get() if hasattr(self, "protocol_var") else "merav"
         if proto == "swan":
-            self.mode_hint.config(
-                text="Swan: תמיד שליחת ESC W ESC e (1B 57 1B 65) — אין מצב שידור רציף.")
+            if self.work_mode.get() == "listen":
+                self.mode_hint.config(
+                    text="Swan האזנה: ראש השקילה שולח רציף — לא נשלח כלום.")
+            else:
+                self.mode_hint.config(
+                    text="Swan שליחה: W (פרוטוקול זהה למירב) — בקשה/תשובה.")
         elif self.work_mode.get() == "listen":
             self.mode_hint.config(
                 text="פסיבי: לא נשלח כלום לראש השקילה. דורש מוד תקשורת 0 או 3 "
@@ -391,17 +431,31 @@ class ScaleSampler:
                      "אינה מגיבה ל-W — השתמש במצב האזנה מולה.")
 
     def _on_protocol_change(self):
-        if self.protocol_var.get() == "swan":
-            self.work_mode.set("poll")
         self._on_mode_change()
+        if hasattr(self, "btn_calib"):
+            is_swan = self.protocol_var.get() == "swan"
+            self.btn_calib.config(
+                state="normal" if (is_swan and self.conn is not None) else "disabled")
 
     def _on_auto_change(self):
         if self.auto_var.get():
+            if hasattr(self, "live_var"):
+                self.live_var.set(False)
             self.frm_manual.grid_remove()
             self.frm_auto.grid()
             self.btn_start.config(text="▶ התחל ניטור")
         else:
             self.frm_auto.grid_remove()
+            self.frm_manual.grid()
+            self.btn_start.config(text="▶ התחל דגימה")
+
+    def _on_live_change(self):
+        if self.live_var.get():
+            self.auto_var.set(False)
+            self.frm_auto.grid_remove()
+            self.frm_manual.grid()
+            self.btn_start.config(text="▶ התחל LIVE")
+        else:
             self.frm_manual.grid()
             self.btn_start.config(text="▶ התחל דגימה")
 
@@ -423,9 +477,11 @@ class ScaleSampler:
         self.show_each.set(cfg.get("show_each", True))
         self.auto_var.set(cfg.get("auto_weigh", False))
         self.threshold_var.set(cfg.get("auto_threshold", 0.5))
+        self.live_var.set(cfg.get("live_mode", False))
         self._on_type_change()
         self._on_protocol_change()
         self._on_auto_change()
+        self._on_live_change()
 
     def _save_settings(self):
         cfg = {
@@ -440,6 +496,7 @@ class ScaleSampler:
             "show_each":      self.show_each.get(),
             "auto_weigh":     self.auto_var.get(),
             "auto_threshold": self.threshold_var.get(),
+            "live_mode":      self.live_var.get(),
         }
         try:
             CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False),
@@ -498,6 +555,15 @@ class ScaleSampler:
                     self._summarize_event(*payload)
                 elif kind == "auto_stopped":
                     self._on_auto_stopped()
+                elif kind == "live_tick":
+                    self._on_live_tick(*payload)
+                elif kind == "live_stopped":
+                    self._on_live_stopped()
+                elif kind == "calib":
+                    if hasattr(self, "_calib_update"):
+                        self._calib_update(*payload)
+                elif kind == "calib_disconnect":
+                    self._disconnect()
         except queue.Empty:
             pass
         self.root.after(40, self._pump_queue)
@@ -538,6 +604,8 @@ class ScaleSampler:
             self.btn_connect.config(state="disabled")
             self.btn_start.config(state="normal")
             self.btn_disconnect.config(state="normal")
+            if self.protocol_var.get() == "swan":
+                self.btn_calib.config(state="normal")
             self._save_settings()
 
         except Exception as e:
@@ -555,6 +623,7 @@ class ScaleSampler:
         self.btn_connect.config(state="normal")
         self.btn_start.config(state="disabled")
         self.btn_disconnect.config(state="disabled")
+        self.btn_calib.config(state="disabled")
         self._log("מנותק")
 
     # ──────────────────────────────────────────────
@@ -613,6 +682,7 @@ class ScaleSampler:
         show_each  = self.show_each.get()
         protocol   = self.protocol_var.get()
         auto_weigh = self.auto_var.get()
+        live_mode  = self.live_var.get()
         threshold  = self.threshold_var.get()
 
         self.running = True
@@ -629,6 +699,11 @@ class ScaleSampler:
             self._log(f"ניטור אוטו [{mode_name} | {proto_name}] — סף {threshold:.2f} kg", "summary")
             threading.Thread(target=self._auto_thread, daemon=True,
                              args=(listen, show_each, protocol, threshold)).start()
+        elif live_mode:
+            self.btn_start.config(text="⏹ עצור LIVE", command=self._stop_live)
+            self._log(f"LIVE [{mode_name} | {proto_name}] — כל {duration:.1f} שניות", "summary")
+            threading.Thread(target=self._live_thread, daemon=True,
+                             args=(duration, listen, show_each, protocol)).start()
         else:
             self.btn_start.config(state="disabled")
             self._log(f"מתחיל דגימה [{mode_name} | {proto_name}] — {duration:.1f} שניות", "summary")
@@ -638,19 +713,22 @@ class ScaleSampler:
     def _stop_auto(self):
         self.running = False
 
+    def _stop_live(self):
+        self.running = False
+
     def _sample_thread(self, duration: float, listen: bool, show_each: bool, protocol: str):
         if protocol == "swan":
-            use_bytes   = True
-            poll_cmd    = b"\x1B\x57\x1B\x65"
-            text_parser = None
+            use_bytes   = False
+            poll_cmd    = None if listen else b"W"
+            text_parser = parse_swan_frame
         elif protocol == "dini":
             use_bytes   = False
             poll_cmd    = None if listen else b"READ\r\n"
             text_parser = parse_dini_frame
         else:
             use_bytes   = False
-            poll_cmd    = None if listen else b"W\r\n"
-            text_parser = parse_frame
+            poll_cmd    = None if listen else b"W"
+            text_parser = parse_swan_frame
         readings: list[tuple[float, float, str]] = []   # (t, weight, status)
         bad = 0
         specials: dict[str, int] = {}
@@ -669,13 +747,23 @@ class ScaleSampler:
 
         try:
             while self.running and (time.perf_counter() - start) < duration:
-                if poll_cmd:
-                    self._write(poll_cmd)
-
-                chunk = self._read_available()
-                if not chunk:
-                    continue
-                buf += chunk
+                if use_bytes:
+                    # Swan: שלח פקודה אם poll, ואז חכה ל-LF (סוף פריים) לפני איטרציה הבאה
+                    if poll_cmd:
+                        self._write(poll_cmd)
+                    deadline = time.perf_counter() + 0.25
+                    while self.running and time.perf_counter() < deadline:
+                        chunk = self._read_available()
+                        buf += chunk
+                        if b"\x0a" in buf:
+                            break
+                else:
+                    if poll_cmd:
+                        self._write(poll_cmd)
+                    chunk = self._read_available()
+                    if not chunk:
+                        continue
+                    buf += chunk
 
                 buf = buf.replace(b"\n", b"\r")
                 while b"\r" in buf:
@@ -697,7 +785,7 @@ class ScaleSampler:
                         if show_each:
                             st = f"  {status}" if status else ""
                             emit(f"  #{idx:>4}   {t:6.3f}s   {w:+10.3f}{st}")
-                    elif text.strip():
+                    elif raw:
                         bad += 1
                         if show_each:
                             emit(f"  {t:6.3f}s   פסולת: {raw!r}", "error")
@@ -744,16 +832,15 @@ class ScaleSampler:
         basis = f"חציון {count} קריאות"
         return decided, basis
 
-    def _add_history_row(self, time_str: str, decided: float):
+    def _add_history_row(self, time_str: str, decided: float, count: int = 0):
         """מוסיף שורה לטבלת ההיסטוריה ומסמן אותה כ'אחרונה' בירוק."""
         self._event_count += 1
-        # הסר הדגשה מכל השורות הקיימות
         for iid in self.history_tree.get_children():
             self.history_tree.item(iid, tags=("normal",))
-        # הכנס חדשה בראש עם הדגשה
         self.history_tree.insert("", 0, tags=("latest",),
                                   values=(self._event_count, time_str,
-                                          f"{decided:+.3f}"))
+                                          f"{decided:+.3f}",
+                                          count if count else "—"))
 
     def _summarize(self, readings, bad, specials, elapsed, listen):
         self.btn_start.config(state="normal")
@@ -791,7 +878,7 @@ class ScaleSampler:
         self.event_range_var.set(
             f"מין/מקס: {min(weights):+.3f} / {max(weights):+.3f}   "
             f"פיזור: {spread:.3f}{sd_str}")
-        self._add_history_row(now_str, decided)
+        self._add_history_row(now_str, decided, count)
 
         self._log(
             f"סיכום: {count} קריאות ב-{elapsed:.2f}s = {rate:.1f}/שנייה", "summary")
@@ -819,17 +906,17 @@ class ScaleSampler:
 
     def _auto_thread(self, listen: bool, show_each: bool, protocol: str, threshold: float):
         if protocol == "swan":
-            use_bytes   = True
-            poll_cmd    = b"\x1B\x57\x1B\x65"
-            text_parser = None
+            use_bytes   = False
+            poll_cmd    = None if listen else b"W"
+            text_parser = parse_swan_frame
         elif protocol == "dini":
             use_bytes   = False
             poll_cmd    = None if listen else b"READ\r\n"
             text_parser = parse_dini_frame
         else:
             use_bytes   = False
-            poll_cmd    = None if listen else b"W\r\n"
-            text_parser = parse_frame
+            poll_cmd    = None if listen else b"W"
+            text_parser = parse_swan_frame
         buf = b""
 
         DEBOUNCE_S = 0.4          # משקל חייב להיות מתחת לסף למשך זמן זה לפני סיום שקילה
@@ -854,13 +941,23 @@ class ScaleSampler:
 
         try:
             while self.running:
-                if poll_cmd:
-                    self._write(poll_cmd)
-
-                chunk = self._read_available()
-                if not chunk:
-                    continue
-                buf += chunk
+                if use_bytes:
+                    # Swan: שלח פקודה אם poll, ואז חכה ל-LF (סוף פריים) לפני איטרציה הבאה
+                    if poll_cmd:
+                        self._write(poll_cmd)
+                    deadline = time.perf_counter() + 0.25
+                    while self.running and time.perf_counter() < deadline:
+                        chunk = self._read_available()
+                        buf += chunk
+                        if b"\x0a" in buf:
+                            break
+                else:
+                    if poll_cmd:
+                        self._write(poll_cmd)
+                    chunk = self._read_available()
+                    if not chunk:
+                        continue
+                    buf += chunk
 
                 buf = buf.replace(b"\n", b"\r")
                 while b"\r" in buf:
@@ -880,7 +977,7 @@ class ScaleSampler:
                         continue
 
                     if w is None:
-                        if text.strip():
+                        if raw:
                             if state == "WEIGHING":
                                 session_bad += 1
                             if show_each:
@@ -981,7 +1078,7 @@ class ScaleSampler:
         time_str = (f"{wall_start.strftime(fmt)} → {end_time_str}   "
                     if wall_start else "")
         self.event_time_var.set(f"{time_str}משך: {elapsed:.2f}s   {count} קריאות @ {rate:.1f}/s")
-        self._add_history_row(end_time_str, decided)
+        self._add_history_row(end_time_str, decided, count)
 
         self._log(f"  {time_str}משך: {elapsed:.2f}s   {count} קריאות @ {rate:.1f}/s", "summary")
         self._log(f"  משקל: {decided:+.3f}   ({basis})", "summary")
@@ -994,8 +1091,386 @@ class ScaleSampler:
 
     def _on_auto_stopped(self):
         self.btn_start.config(command=self._start_sampling)
-        self._on_auto_change()  # משחזר טקסט נכון לפי מצב ה-checkbox
+        self._on_auto_change()
         self._log("ניטור הסתיים", "summary")
+
+    # ──────────────────────────────────────────────
+    # Live thread
+    # ──────────────────────────────────────────────
+
+    def _live_thread(self, duration: float, listen: bool, show_each: bool, protocol: str):
+        if protocol == "swan":
+            use_bytes   = False
+            poll_cmd    = None if listen else b"W"
+            text_parser = parse_swan_frame
+        elif protocol == "dini":
+            use_bytes   = False
+            poll_cmd    = None if listen else b"READ\r\n"
+            text_parser = parse_dini_frame
+        else:
+            use_bytes   = False
+            poll_cmd    = None if listen else b"W"
+            text_parser = parse_swan_frame
+
+        buf = b""
+        tick_num = 0
+
+        def emit(msg, tag="reading"):
+            self.ui_queue.put(("log", (msg, tag)))
+
+        try:
+            self._flush_input()
+        except Exception:
+            pass
+
+        try:
+            while self.running:
+                window_readings: list[tuple[float, float, str]] = []
+                window_start = time.perf_counter()
+                window_wall  = datetime.datetime.now()
+
+                # ── אסוף קריאות למשך duration שניות ──
+                while self.running and (time.perf_counter() - window_start) < duration:
+                    if use_bytes:
+                        if poll_cmd:
+                            self._write(poll_cmd)
+                        deadline = time.perf_counter() + 0.25
+                        while self.running and time.perf_counter() < deadline:
+                            chunk = self._read_available()
+                            buf += chunk
+                            if b"\x0a" in buf:
+                                break
+                    else:
+                        if poll_cmd:
+                            self._write(poll_cmd)
+                        chunk = self._read_available()
+                        if not chunk:
+                            continue
+                        buf += chunk
+
+                    buf = buf.replace(b"\n", b"\r")
+                    while b"\r" in buf:
+                        raw, buf = buf.split(b"\r", 1)
+                        t_rel = time.perf_counter() - window_start
+                        if use_bytes:
+                            w, status, special = parse_swan_frame_bytes(raw)
+                        else:
+                            text = raw.decode("ascii", errors="replace")
+                            w, status, special = text_parser(text)
+
+                        if w is not None:
+                            window_readings.append((t_rel, w, status))
+                            self.ui_queue.put(("live", w))
+                            if show_each:
+                                st = f"  {status}" if status else ""
+                                emit(f"  #{len(window_readings):>4}   {t_rel:6.3f}s   {w:+10.3f}{st}")
+
+                # ── סיכום החלון ──
+                wall_end = datetime.datetime.now()
+                elapsed  = time.perf_counter() - window_start
+                if window_readings:
+                    tick_num += 1
+                    self.ui_queue.put(("live_tick",
+                                      (tick_num, window_wall, wall_end,
+                                       window_readings, elapsed)))
+
+        except IOError as e:
+            emit(f"שגיאת תקשורת: {e}", "error")
+        except Exception as e:
+            emit(f"שגיאה: {e}", "error")
+
+        self.running = False
+        self.ui_queue.put(("live_stopped", None))
+
+    def _on_live_tick(self, tick_num, wall_start, wall_end, readings, elapsed):
+        weights = [w for _, w, _ in readings]
+        count   = len(weights)
+        rate    = count / elapsed if elapsed > 0 else 0
+        decided, basis = self._decide_weight(readings)
+
+        fmt      = "%H:%M:%S"
+        time_str = wall_end.strftime(fmt)
+
+        self.weight_var.set(f"{decided:.3f}")
+        self.readings_var.set(str(count))
+        self.rate_var.set(f"{rate:.1f}")
+        self.event_time_var.set(
+            f"{wall_start.strftime(fmt)} → {time_str}   "
+            f"{count} קריאות @ {rate:.1f}/s")
+        self.event_detail_var.set(f"משקל: {decided:+.3f}   ({basis})")
+        self.event_range_var.set(
+            f"מין/מקס: {min(weights):+.3f} / {max(weights):+.3f}   "
+            f"פיזור: {max(weights)-min(weights):.3f}")
+        self._add_history_row(time_str, decided, count)
+        self._log(
+            f"  #{tick_num:>3}  {time_str}   {count:>4} קריאות   {decided:+.3f} kg", "summary")
+
+    def _on_live_stopped(self):
+        self.btn_start.config(command=self._start_sampling)
+        self._on_live_change()
+        self._log("LIVE הסתיים", "summary")
+
+
+    # ──────────────────────────────────────────────
+    # Swan calibration wizard
+    # ──────────────────────────────────────────────
+
+    def _open_swan_calib(self):
+        if self.running:
+            self._log("עצור את הדגימה לפני הכיול", "warn")
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("כיול Swan — PC0035")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.focus_set()
+        dlg.minsize(440, 420)
+
+        self._calib_event  = threading.Event()
+        self._calib_active = True
+        self.btn_start.config(state="disabled")
+
+        # ── משקל כיול ──
+        frm_top = ttk.LabelFrame(dlg, text="הגדרות כיול")
+        frm_top.pack(fill="x", padx=12, pady=(12, 6))
+        ttk.Label(frm_top, text="משקל כיול:").grid(row=0, column=0, padx=8, pady=6, sticky="e")
+        calib_weight_var = tk.IntVar(value=3000)
+        spn_w = ttk.Spinbox(frm_top, textvariable=calib_weight_var,
+                             from_=100, to=99999, increment=100, width=9, format="%d")
+        spn_w.grid(row=0, column=1, padx=4, pady=6, sticky="w")
+        ttk.Label(frm_top, text="גרמים").grid(row=0, column=2, sticky="w")
+
+        # ── סטטוס ──
+        frm_st = ttk.LabelFrame(dlg, text="מצב")
+        frm_st.pack(fill="x", padx=12, pady=6)
+        step_var = tk.StringVar(value="הכנס משקל כיול ולחץ 'התחל כיול'")
+        ttk.Label(frm_st, textvariable=step_var,
+                  font=("Arial", 11, "bold"), foreground="#1a3a6b",
+                  wraplength=390, justify="right", anchor="w").pack(
+            padx=10, pady=(10, 4), fill="x")
+        prog_var = tk.StringVar(value="")
+        ttk.Label(frm_st, textvariable=prog_var,
+                  font=("Consolas", 9), foreground="#555").pack(padx=10, pady=(0, 4))
+        pb = ttk.Progressbar(frm_st, orient="horizontal", length=400, maximum=14)
+        pb.pack(padx=10, pady=(0, 10))
+
+        # ── לוג תגובות המאזניים ──
+        frm_resp = ttk.LabelFrame(dlg, text="תגובת המאזניים")
+        frm_resp.pack(fill="x", padx=12, pady=6)
+        resp_box = scrolledtext.ScrolledText(frm_resp, height=4, state="disabled",
+                                              font=("Consolas", 8), bg="#f4f4f4")
+        resp_box.pack(padx=6, pady=6, fill="x")
+
+        def resp_log(txt):
+            resp_box.config(state="normal")
+            resp_box.insert("end", txt + "\n")
+            resp_box.see("end")
+            resp_box.config(state="disabled")
+
+        # ── כפתורים ──
+        frm_b = ttk.Frame(dlg)
+        frm_b.pack(padx=12, pady=(4, 12))
+        btn_act = ttk.Button(frm_b, text="התחל כיול", width=14)
+        btn_act.pack(side="left", padx=6)
+        btn_cls = ttk.Button(frm_b, text="סגור", width=10)
+        btn_cls.pack(side="left", padx=6)
+
+        # ── helpers ──
+        def _close():
+            self._calib_active = False
+            self._calib_event.set()
+            if hasattr(self, "_calib_update"):
+                del self._calib_update
+            try:
+                self.btn_start.config(state="normal" if self.conn else "disabled")
+            except Exception:
+                pass
+            dlg.destroy()
+
+        def _on_continue():
+            self._calib_event.set()
+            btn_act.config(state="disabled", text="ממתין...")
+            btn_cls.config(state="disabled")
+
+        def _on_start():
+            w = calib_weight_var.get()
+            btn_act.config(state="disabled")
+            spn_w.config(state="disabled")
+            btn_cls.config(state="disabled")
+            threading.Thread(target=self._calib_thread, daemon=True, args=(w,)).start()
+
+        btn_act.config(command=_on_start)
+        btn_cls.config(command=_close)
+        dlg.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        # ── update dispatcher ──
+        def calib_update(kind, data):
+            if kind == "status":
+                step_var.set(str(data))
+            elif kind == "progress":
+                n = int(data)
+                pb["value"] = min(n, 14)
+                prog_var.set("*" * min(n, 14) + f"  ({n}/14)")
+            elif kind == "response":
+                resp_log(str(data))
+            elif kind == "step":
+                pb["value"] = 0
+                prog_var.set("")
+                name = data[0] if data else ""
+                if name == "clear_platform":
+                    step_var.set("הסר הכל מהמשטח ולחץ 'המשך'")
+                    btn_act.config(state="normal", text="המשך ▶", command=_on_continue)
+                    btn_cls.config(state="disabled")
+                elif name == "put_weight":
+                    wg = data[1] if len(data) > 1 else "?"
+                    step_var.set(f"הנח {wg}g על המשטח ולחץ 'המשך'")
+                    btn_act.config(state="normal", text="המשך ▶", command=_on_continue)
+                    btn_cls.config(state="disabled")
+                elif name == "confirm_save":
+                    step_var.set("כיול הושלם — לחץ 'המשך' לשמירה ואיתחול")
+                    btn_act.config(state="normal", text="המשך ▶", command=_on_continue)
+                    btn_cls.config(state="disabled")
+                elif name == "done":
+                    step_var.set("שמירה בוצעה — ממתין לאיתחול המאזניים...")
+                    btn_act.config(state="disabled")
+                    btn_cls.config(state="disabled")
+                    pb["value"] = 14
+            elif kind == "complete":
+                step_var.set("כיול הושלם בהצלחה ✓")
+                prog_var.set("ניתן לסגור ולהתחבר מחדש")
+                pb["value"] = 14
+                btn_act.config(state="disabled")
+                btn_cls.config(state="normal")
+                dlg.protocol("WM_DELETE_WINDOW", _close)
+            elif kind == "error":
+                step_var.set(f"שגיאה: {data}")
+                prog_var.set("")
+                btn_act.config(state="disabled")
+                btn_cls.config(state="normal")
+                dlg.protocol("WM_DELETE_WINDOW", _close)
+
+        self._calib_update = calib_update
+
+    def _calib_thread(self, weight_g: int):
+        def emit(kind, data=None):
+            self.ui_queue.put(("calib", (kind, data)))
+
+        def read_until(patterns, timeout_idle=1.0, timeout_total=30.0):
+            buf = b""
+            t0 = time.perf_counter()
+            t_last = t0
+            while time.perf_counter() - t0 < timeout_total:
+                if not self._calib_active:
+                    break
+                try:
+                    chunk = self._read_available()
+                except Exception:
+                    break
+                if chunk:
+                    buf += chunk
+                    t_last = time.perf_counter()
+                    new_ast = chunk.count(b"*")
+                    if new_ast:
+                        emit("progress", buf.count(b"*"))
+                    decoded = buf.decode("ascii", errors="replace")
+                    if any(p in decoded for p in patterns):
+                        time.sleep(0.15)
+                        try:
+                            extra = self._read_available()
+                            if extra:
+                                buf += extra
+                        except Exception:
+                            pass
+                        break
+                else:
+                    if buf and time.perf_counter() - t_last > timeout_idle:
+                        break
+            return buf.decode("ascii", errors="replace")
+
+        try:
+            # ── שלב 0: ESC P weight ESC e ──
+            self._flush_input()
+            self._write(b"\x1B\x50" + str(weight_g).encode("ascii") + b"\x1B\x65")
+            emit("status", f"נשלח: ESC P {weight_g} ESC e — ממתין...")
+
+            text = read_until(["Clear", "clear", "platform"], timeout_idle=0.8, timeout_total=5.0)
+            if not self._calib_active:
+                return
+            emit("response", text.strip())
+            if not any(w in text.lower() for w in ["clear", "platform"]):
+                emit("error", f"תגובה לא צפויה:\n{text!r}")
+                return
+            emit("step", ("clear_platform",))
+
+            if not self._calib_event.wait(timeout=120):
+                emit("error", "זמן ההמתנה פג")
+                return
+            self._calib_event.clear()
+            if not self._calib_active:
+                return
+
+            # ── שלב 1: ESC N ESC e — כיול אפס ──
+            self._write(b"\x1B\x4E\x1B\x65")
+            emit("status", "מבצע כיול אפס...")
+
+            text = read_until(["Put", "put"], timeout_idle=1.2, timeout_total=25.0)
+            if not self._calib_active:
+                return
+            emit("response", text.strip()[:300])
+            if not any(w in text for w in ["Put", "put"]):
+                emit("error", f"לא התקבלה הנחיה 'Put':\n{text!r}")
+                return
+            emit("step", ("put_weight", weight_g, text.count("*")))
+
+            if not self._calib_event.wait(timeout=300):
+                emit("error", "זמן ההמתנה פג")
+                return
+            self._calib_event.clear()
+            if not self._calib_active:
+                return
+
+            # ── שלב 2: ESC N ESC e — כיול משקל ──
+            self._write(b"\x1B\x4E\x1B\x65")
+            emit("status", "מבצע כיול משקל...")
+
+            text = read_until(["save", "Save"], timeout_idle=1.2, timeout_total=25.0)
+            if not self._calib_active:
+                return
+            emit("response", text.strip()[:300])
+            if "save" not in text.lower():
+                emit("error", f"לא התקבלה הנחיה לשמירה:\n{text!r}")
+                return
+            emit("step", ("confirm_save",))
+
+            if not self._calib_event.wait(timeout=60):
+                emit("error", "זמן ההמתנה פג")
+                return
+            self._calib_event.clear()
+            if not self._calib_active:
+                return
+
+            # ── שלב 3: ESC N ESC e — שמירה ואיתחול ──
+            self._write(b"\x1B\x4E\x1B\x65")
+            emit("status", "שומר ומאתחל...")
+
+            text = read_until(["DONE", "REBOOT"], timeout_idle=2.0, timeout_total=12.0)
+            emit("response", text.strip()[:200])
+            emit("step", ("done",))
+
+            for i in range(7):
+                if not self._calib_active:
+                    return
+                time.sleep(1)
+                emit("status", f"ממתין לאיתחול... {i + 1}/7")
+
+            emit("complete", None)
+            self.ui_queue.put(("calib_disconnect", None))
+
+        except IOError as e:
+            emit("error", f"שגיאת תקשורת: {e}")
+        except Exception as e:
+            emit("error", f"שגיאה: {e}")
 
 
 # ──────────────────────────────────────────────
