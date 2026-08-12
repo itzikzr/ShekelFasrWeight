@@ -1,4 +1,7 @@
 __pycache__/
 *.pyc
 scale_sampler_config.json
+scale_data.db
+scale_data.db-journal
+scale_data.db-wal
 .claude/

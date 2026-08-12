@@ -1,0 +1,475 @@
+"""
+מסך הבית — מסוע עובד כל הזמן; כשמתגלה משקל מעל הסף האפליקציה ממצעת ורושמת תוצאה.
+
+זהו המקום היחיד שנוגע ב-Tk וב-DB בעקבות אירועי engine — התהליכונים ב-engine.py
+דוחפים (kind, payload) ל-ui_queue, וכאן (בתהליכון הראשי, דרך _pump_queue) אנחנו
+קוראים את מזהה המוצר הנבחר-כרגע, מסווגים רמזור, וכותבים ל-DB. כך בחירת מוצר יכולה
+להשתנות בין שקילה לשקילה בלי שתהליכון הרקע ידע על Tk בכלל.
+"""
+
+import json
+import queue
+import tkinter as tk
+from tkinter import ttk, messagebox
+from pathlib import Path
+
+from . import db, theme
+from .engine import WeighingEngine, decide_weight
+from .formatting import fmt_weight
+from .widgets import TrafficLight, StatusPill
+from .settings_window import SettingsWindow
+from .products_window import ProductsWindow
+from .history_window import HistoryWindow
+from .weighing_detail_window import WeighingDetailWindow
+from .scale_config_window import ScaleConfigWindow
+from .version import __version__
+
+CONFIG_FILE = Path(__file__).resolve().parent.parent / "scale_sampler_config.json"
+
+NO_PRODUCT_LABEL = "— ללא מוצר —"
+
+VERDICT_TEXT = {
+    "green":  "✓ בטווח",
+    "red":    "⚠ מעל הטווח",
+    "yellow": "⚠ מתחת לטווח",
+    "none":   "—",
+}
+
+
+class MainWindow:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title(f"Swan  v{__version__}")
+        theme.set_app_icon(root)
+
+        try:
+            _early_cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            _early_cfg = {}
+        self.dark_mode = bool(_early_cfg.get("dark_mode", False))
+        self.fonts = theme.set_mode(root, "dark" if self.dark_mode else "light")
+        self.root.minsize(980, 640)
+
+        db.connect()
+
+        self.ui_queue: "queue.Queue" = queue.Queue()
+        self.engine = WeighingEngine(self.ui_queue)
+
+        self.current_product_id = None
+        self._product_name_to_id = {}
+
+        self.settings_window = None
+        self.products_window = None
+        self.history_window = None
+        self.scale_config_window = None
+
+        self._build_ui()
+        self._load_settings()
+        self.refresh_products()
+        self._load_recent_from_db()
+        self._pump_queue()
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ──────────────────────────────────────────────
+    # UI
+    # ──────────────────────────────────────────────
+
+    def _build_ui(self):
+        f = self.fonts
+        outer = ttk.Frame(self.root)
+        outer.pack(fill="both", expand=True, padx=14, pady=14)
+
+        # ── כותרת עליונה ──
+        header = ttk.Frame(outer, style="Card.TFrame")
+        header.pack(fill="x", pady=(0, 12))
+        header.configure(padding=12)
+
+        # במסך מלא (theme.maximize) אין שורת כותרת עם כפתור סגירה של Windows —
+        # לכן חייבים כפתור סגירה משלנו, בפינה שבה משתמשים מצפים למצוא אותו.
+        ttk.Button(header, text="✕ סגור", width=8,
+                  command=self._on_close).pack(side="right", padx=(8, 0))
+
+        brand_frame = ttk.Frame(header, style="Card.TFrame")
+        brand_frame.pack(side="right", padx=8)
+
+        self._logo_image = tk.PhotoImage(file=str(theme.ASSETS_DIR / "logo.png"))
+        self.logo_label = tk.Label(brand_frame, image=self._logo_image, background=theme.CARD_BG)
+        self.logo_label.pack(side="right", padx=(8, 0))
+
+        brand_text = ttk.Frame(brand_frame, style="Card.TFrame")
+        brand_text.pack(side="right")
+        self.version_label = tk.Label(brand_text, text=f"גרסה {__version__}",
+                                      font=(f["sans"], 8), background=theme.CARD_BG,
+                                      foreground=theme.TEXT_MUTED)
+        self.version_label.pack(anchor="e")
+
+        self.status_pill = StatusPill(header)
+        self.status_pill.pack(side="right", padx=(0, 16))
+        self.status_pill.set("מנותק", theme.IDLE_GRAY)
+
+        self.btn_connect_toggle = ttk.Button(header, text="התחבר", style="Accent.TButton",
+                                             command=self._on_connect_click)
+        self.btn_connect_toggle.pack(side="right", padx=(0, 16))
+
+        self.btn_theme_toggle = ttk.Button(header, text=self._theme_toggle_label(),
+                                           command=self._toggle_theme, width=11)
+        self.btn_theme_toggle.pack(side="left", padx=3)
+
+        btns = ttk.Frame(header, style="Card.TFrame")
+        btns.pack(side="left", padx=4)
+        ttk.Button(btns, text="📜 היסטוריה", command=self.open_history).pack(side="left", padx=3)
+        ttk.Button(btns, text="📦 מוצרים", command=self.open_products).pack(side="left", padx=3)
+        ttk.Button(btns, text="🛠 תצורת משקל", command=self.open_scale_config).pack(side="left", padx=3)
+        ttk.Button(btns, text="⚙ הגדרות", command=self.open_settings).pack(side="left", padx=3)
+
+        prod_frame = ttk.Frame(header, style="Card.TFrame")
+        prod_frame.pack(side="left", padx=16)
+        self.product_caption_label = tk.Label(prod_frame, text="מוצר:", background=theme.CARD_BG,
+                                               foreground=theme.TEXT)
+        self.product_caption_label.pack(side="right", padx=(0, 6))
+        self.product_var = tk.StringVar(value=NO_PRODUCT_LABEL)
+        self.product_combo = ttk.Combobox(prod_frame, textvariable=self.product_var,
+                                          state="readonly", width=22)
+        self.product_combo.pack(side="right")
+        self.product_combo.bind("<<ComboboxSelected>>", self._on_product_selected)
+
+        # ── תוכן: שקילות אחרונות משמאל (מלא לגובה) | משקל+רמזור מימין (מלא לגובה) ──
+        content = ttk.Frame(outer)
+        content.pack(fill="both", expand=True)
+        content.rowconfigure(0, weight=1)
+        content.columnconfigure(0, weight=2)   # שמאל — שקילות אחרונות
+        content.columnconfigure(1, weight=3)   # ימין — משקל + רמזור
+
+        # ── ימין: משקל + רמזור, ממורכזים ומלאים לגובה ──
+        RIGHT_PANEL_WIDTH = 420   # קבוע בכוונה, ראו ההערה למטה
+
+        right_panel = ttk.Frame(content, style="Card.TFrame", width=RIGHT_PANEL_WIDTH)
+        right_panel.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        # מבטל את התפשטות הגודל מהתוכן: בלי זה, הודעת סטטוס ארוכה (למשל "מתחת
+        # למינימום השמירה — לא נשמר") הייתה מגדילה את הרוחב הטבעי של right_panel,
+        # וה-grid החוצה היה "גונב" רוחב מהעמודה השנייה (שקילות אחרונות) — כך
+        # שגודל הטבלה היה משתנה בכל שינוי טקסט. הרוחב נשאר קבוע; sticky="nsew"
+        # עדיין מותח אותו לגובה המלא.
+        right_panel.pack_propagate(False)
+
+        # pack(expand=True) ולא place() בכוונה: place() לא מדווח את הגודל הטבעי שלו
+        # להורה, כך שה-grid החוצה היה מקצה ל-right_panel שטח מזערי ותוכן הפנים
+        # (המשקל בגופן גדול) היה נחתך מעבר לגבול החלון. pack עם expand מרכז בדיוק
+        # אותו הדבר, אבל מדווח נכון את הגודל הנדרש כלפי מעלה.
+        right_inner = ttk.Frame(right_panel, style="Card.TFrame")
+        right_inner.pack(expand=True)
+
+        self.weight_var = tk.StringVar(value="---")
+        self.weight_caption_label = tk.Label(right_inner, text="משקל נוכחי", font=(f["sans"], 11),
+                                             background=theme.CARD_BG, foreground=theme.TEXT_MUTED)
+        self.weight_caption_label.pack(pady=(0, 2))
+        self.weight_label = tk.Label(right_inner, textvariable=self.weight_var,
+                                     font=(f["mono"], 56, "bold"),
+                                     background=theme.CARD_BG, foreground=theme.ACCENT)
+        self.weight_label.pack()
+
+        self.traffic = TrafficLight(right_inner, size=110)
+        self.traffic.pack(pady=18)
+
+        self.status_line_var = tk.StringVar(value="מנותק — פתח הגדרות להתחברות")
+        self.status_line_label = tk.Label(right_inner, textvariable=self.status_line_var,
+                                          font=(f["sans"], 12), wraplength=RIGHT_PANEL_WIDTH - 60,
+                                          justify="center",
+                                          background=theme.CARD_BG, foreground=theme.TEXT)
+        self.status_line_label.pack()
+
+        # ── שמאל: שקילות אחרונות, מלא לגובה ──
+        recent = ttk.LabelFrame(content, text="שקילות אחרונות")
+        recent.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        recent.columnconfigure(0, weight=1)
+        recent.rowconfigure(0, weight=1)
+
+        cols = ("#", "שעה", "מוצר", "משקל (kg)", "תוצאה", "קריאות", "משך")
+        self.recent_tree = ttk.Treeview(recent, columns=cols, show="headings")
+        for c, w, anchor in (("#", 45, "center"), ("שעה", 90, "center"), ("מוצר", 160, "e"),
+                             ("משקל (kg)", 100, "e"), ("תוצאה", 130, "center"),
+                             ("קריאות", 70, "center"), ("משך", 70, "center")):
+            self.recent_tree.heading(c, text=c)
+            self.recent_tree.column(c, width=w, anchor=anchor, stretch=(c == "מוצר"))
+        self.recent_tree.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=8)
+        self.recent_tree.bind("<Double-1>", self._on_recent_double_click)
+
+        sb = ttk.Scrollbar(recent, orient="vertical", command=self.recent_tree.yview)
+        self.recent_tree.configure(yscrollcommand=sb.set)
+        sb.grid(row=0, column=1, sticky="ns", pady=8)
+
+        for verdict, (fg, bg) in theme.VERDICT_COLORS.items():
+            self.recent_tree.tag_configure(verdict, background=bg, foreground=fg)
+
+        footer = ttk.Frame(recent)
+        footer.grid(row=1, column=0, columnspan=2, sticky="e", padx=8, pady=(0, 8))
+        ttk.Button(footer, text="הצג את כל ההיסטוריה →", command=self.open_history).pack()
+
+    # ──────────────────────────────────────────────
+    # Theme (בהיר/כהה)
+    # ──────────────────────────────────────────────
+
+    def _theme_toggle_label(self):
+        return "☀ מצב בהיר" if self.dark_mode else "🌙 מצב כהה"
+
+    def _toggle_theme(self):
+        self.dark_mode = not self.dark_mode
+        self.fonts = theme.set_mode(self.root, "dark" if self.dark_mode else "light")
+        self.save_settings()
+        self._refresh_theme_widgets()
+
+    def _refresh_theme_widgets(self):
+        """ מעדכן ווידג'טי tk גולמיים שלא מתעדכנים אוטומטית ע"י ה-ttk style. """
+        self.btn_theme_toggle.config(text=self._theme_toggle_label())
+
+        for label in (self.logo_label, self.version_label,
+                      self.product_caption_label, self.weight_caption_label,
+                      self.weight_label, self.status_line_label):
+            label.configure(background=theme.CARD_BG)
+        self.version_label.configure(foreground=theme.TEXT_MUTED)
+        self.product_caption_label.configure(foreground=theme.TEXT)
+        self.weight_caption_label.configure(foreground=theme.TEXT_MUTED)
+        self.weight_label.configure(foreground=theme.ACCENT)
+        self.status_line_label.configure(foreground=theme.TEXT)
+
+        self.status_pill.refresh_theme()
+        self.status_pill.set(*(("מחובר", theme.GREEN) if self.engine.connected
+                               else ("מנותק", theme.IDLE_GRAY)))
+        self.traffic.refresh_theme()
+
+        for verdict, (fg, bg) in theme.VERDICT_COLORS.items():
+            self.recent_tree.tag_configure(verdict, background=bg, foreground=fg)
+
+        for win in (self.settings_window, self.products_window, self.history_window,
+                    self.scale_config_window):
+            if win is not None and win.winfo_exists():
+                win.refresh_theme()
+
+    # ──────────────────────────────────────────────
+    # Settings persistence
+    # ──────────────────────────────────────────────
+
+    def _load_settings(self):
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            cfg = {}
+        self.port = cfg.get("port", "")
+        self.baud = cfg.get("baud", "9600")
+        self.engine.settings.listen = cfg.get("listen", True)
+        self.engine.settings.threshold = cfg.get("threshold", 0.5)
+        self.engine.settings.debounce_s = cfg.get("debounce_s", 0.4)
+        self.engine.settings.show_each = cfg.get("show_each", True)
+        self.engine.settings.min_save_weight = cfg.get("min_save_weight", 0.0)
+        self.sample_duration = cfg.get("sample_duration", 1.0)
+        self.live_window = cfg.get("live_window", 1.0)
+        self.current_product_id = cfg.get("product_id")
+        self.dark_mode = bool(cfg.get("dark_mode", self.dark_mode))
+
+    def save_settings(self):
+        cfg = {
+            "port": self.port,
+            "baud": self.baud,
+            "listen": self.engine.settings.listen,
+            "threshold": self.engine.settings.threshold,
+            "debounce_s": self.engine.settings.debounce_s,
+            "show_each": self.engine.settings.show_each,
+            "min_save_weight": self.engine.settings.min_save_weight,
+            "sample_duration": self.sample_duration,
+            "live_window": self.live_window,
+            "product_id": self.current_product_id,
+            "dark_mode": self.dark_mode,
+        }
+        try:
+            CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    # ──────────────────────────────────────────────
+    # Connection (מהכפתור במסך הראשי או ממסך ההגדרות)
+    # ──────────────────────────────────────────────
+
+    def _on_connect_click(self):
+        if self.engine.connected:
+            self.disconnect()
+            return
+        if not self.port:
+            messagebox.showinfo("התחברות", "יש לבחור פורט בהגדרות לפני ההתחברות.")
+            self.open_settings()
+            return
+        try:
+            self.connect(self.port, self.baud)
+        except Exception as e:
+            messagebox.showerror("שגיאת חיבור", str(e))
+
+    def _sync_connect_button(self):
+        self.btn_connect_toggle.config(text="התנתק" if self.engine.connected else "התחבר")
+
+    def connect(self, port_name: str, baud: str):
+        self.engine.connect(port_name, int(baud))
+        self.port, self.baud = port_name, baud
+        self.save_settings()
+        self.status_pill.set("מחובר", theme.GREEN)
+        self.status_line_var.set("מחכה למשקל...")
+        self._sync_connect_button()
+        self.engine.start_monitor()
+
+    def disconnect(self):
+        self.engine.disconnect()
+        self.status_pill.set("מנותק", theme.IDLE_GRAY)
+        self.status_line_var.set("מנותק — פתח הגדרות להתחברות")
+        self.weight_var.set("---")
+        self.traffic.set_state("none")
+        self._sync_connect_button()
+
+    # ──────────────────────────────────────────────
+    # Products
+    # ──────────────────────────────────────────────
+
+    def refresh_products(self):
+        products = db.list_products()
+        self._product_name_to_id = {p["name"]: p["id"] for p in products}
+        values = [NO_PRODUCT_LABEL] + [p["name"] for p in products]
+        self.product_combo.config(values=values)
+
+        name_by_id = {p["id"]: p["name"] for p in products}
+        if self.current_product_id in name_by_id:
+            self.product_var.set(name_by_id[self.current_product_id])
+        else:
+            self.current_product_id = None
+            self.product_var.set(NO_PRODUCT_LABEL)
+
+    def _on_product_selected(self, _event=None):
+        name = self.product_var.get()
+        self.current_product_id = self._product_name_to_id.get(name)
+        self.save_settings()
+
+    # ──────────────────────────────────────────────
+    # Child windows
+    # ──────────────────────────────────────────────
+
+    def open_settings(self):
+        if self.settings_window is None or not self.settings_window.winfo_exists():
+            self.settings_window = SettingsWindow(self)
+        else:
+            self.settings_window.lift()
+            self.settings_window.focus_set()
+
+    def open_products(self):
+        if self.products_window is None or not self.products_window.winfo_exists():
+            self.products_window = ProductsWindow(self)
+        else:
+            self.products_window.lift()
+            self.products_window.focus_set()
+
+    def open_history(self):
+        if self.history_window is None or not self.history_window.winfo_exists():
+            self.history_window = HistoryWindow(self)
+        else:
+            self.history_window.lift()
+            self.history_window.focus_set()
+
+    def open_scale_config(self):
+        if self.scale_config_window is None or not self.scale_config_window.winfo_exists():
+            self.scale_config_window = ScaleConfigWindow(self)
+        else:
+            self.scale_config_window.lift()
+            self.scale_config_window.focus_set()
+
+    def _on_close(self):
+        try:
+            self.engine.disconnect()
+        except Exception:
+            pass
+        self.root.destroy()
+
+    # ──────────────────────────────────────────────
+    # Event pump — היחיד שנוגע ב-Tk וב-DB
+    # ──────────────────────────────────────────────
+
+    def _pump_queue(self):
+        try:
+            while True:
+                kind, payload = self.ui_queue.get_nowait()
+                if kind == "live":
+                    # מציגים בדיוק כמו שההתקן שלח (payload[1] = מספר הספרות
+                    # אחרי הנקודה בפריים הגולמי) — לא כופים פורמט קבוע (3 ספרות).
+                    w, decimals = payload
+                    self.weight_var.set(fmt_weight(w, decimals=decimals if decimals is not None else 3))
+                elif kind == "session_start":
+                    self.status_line_var.set("שוקל...")
+                elif kind == "session_done":
+                    self._on_session_done(*payload)
+                elif kind == "monitor_stopped":
+                    pass
+                else:
+                    # אירועי דיאגנוסטיקה/כיול — רלוונטיים רק אם מסך ההגדרות פתוח
+                    if self.settings_window is not None and self.settings_window.winfo_exists():
+                        self.settings_window.handle_engine_event(kind, payload)
+                    # אירועי תצורת משקל — רלוונטיים רק אם המסך הזה פתוח
+                    if (self.scale_config_window is not None
+                            and self.scale_config_window.winfo_exists()):
+                        self.scale_config_window.handle_engine_event(kind, payload)
+                    if kind in ("calib_disconnect", "device_reset_disconnect"):
+                        self.disconnect()
+        except queue.Empty:
+            pass
+        self.root.after(40, self._pump_queue)
+
+    def _on_session_done(self, readings, elapsed, wall_start, wall_end):
+        decided, basis, window_start, window_end = decide_weight(readings)
+        weights = [w for _, w, _ in readings]
+        count = len(weights)
+        self.weight_var.set(fmt_weight(decided))
+
+        if decided < self.engine.settings.min_save_weight:
+            self.status_line_var.set(
+                f"משקל {fmt_weight(decided)} kg מתחת למינימום השמירה — לא נשמר")
+            return
+
+        product = db.get_product(self.current_product_id) if self.current_product_id else None
+        verdict, row_id = db.insert_weighing(decided, count, elapsed, min(weights), max(weights),
+                                             basis, product)
+        db.insert_weighing_readings(row_id, readings, window_start, window_end)
+
+        self.traffic.set_state(verdict)
+        self.status_line_var.set(
+            f"הושלם: {fmt_weight(decided)} kg   {VERDICT_TEXT[verdict]}   "
+            f"({count} קריאות, {elapsed:.1f}s)")
+
+        product_name = product["name"] if product else NO_PRODUCT_LABEL
+        self._add_recent_row(row_id, wall_end, product_name, decided, verdict, count, elapsed)
+
+        if self.history_window is not None and self.history_window.winfo_exists():
+            self.history_window.refresh()
+
+    def _add_recent_row(self, row_id, wall_end, product_name, decided, verdict, count, elapsed):
+        time_str = wall_end.strftime("%H:%M:%S")
+        self.recent_tree.insert("", 0, iid=str(row_id), tags=(verdict,),
+                                values=(row_id, time_str, product_name,
+                                        fmt_weight(decided, force_sign=True),
+                                        VERDICT_TEXT[verdict], count, f"{elapsed:.2f}s"))
+
+    def _load_recent_from_db(self):
+        """ מציג את כל השקילות שנשמרו (לא רק מה שקרה בהרצה הנוכחית). """
+        for r in db.list_weighings():
+            time_str = r["timestamp"][11:19] if r["timestamp"] and len(r["timestamp"]) >= 19 \
+                else (r["timestamp"] or "")
+            product_name = r["product_name"] or NO_PRODUCT_LABEL
+            elapsed_str = f"{r['elapsed_seconds']:.2f}s" if r["elapsed_seconds"] is not None else "—"
+            self.recent_tree.insert("", "end", iid=str(r["id"]), tags=(r["verdict"],),
+                                    values=(r["id"], time_str, product_name,
+                                            fmt_weight(r["decided_weight"], force_sign=True),
+                                            VERDICT_TEXT.get(r["verdict"], r["verdict"]),
+                                            r["reading_count"] or 0, elapsed_str))
+
+    def _on_recent_double_click(self, _event=None):
+        sel = self.recent_tree.selection()
+        if not sel:
+            return
+        try:
+            weighing_id = int(sel[0])
+        except ValueError:
+            return
+        WeighingDetailWindow(self, weighing_id)
