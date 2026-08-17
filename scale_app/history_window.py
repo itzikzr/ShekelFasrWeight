@@ -19,7 +19,8 @@ class HistoryWindow(tk.Toplevel):
         super().__init__(main.root)
         self.main = main
         self.title("היסטוריית שקילות")
-        self.geometry("920x540")
+        self.minsize(920, 540)
+        theme.maximize_window(self)
         self.configure(background=theme.BG)
 
         self._current_rows = []

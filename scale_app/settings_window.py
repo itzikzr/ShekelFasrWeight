@@ -25,7 +25,8 @@ class SettingsWindow(tk.Toplevel):
         self.main = main
         self.engine = main.engine
         self.title("הגדרות")
-        self.geometry("640x560")
+        self.minsize(640, 560)
+        theme.maximize_window(self)
         self.configure(background=theme.BG)
 
         self._live_running = False

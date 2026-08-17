@@ -14,7 +14,8 @@ class ProductsWindow(tk.Toplevel):
         super().__init__(main.root)
         self.main = main
         self.title("מוצרים")
-        self.geometry("640x420")
+        self.minsize(640, 420)
+        theme.maximize_window(self)
         self.configure(background=theme.BG)
 
         cols = ("שם", "משקל מטרה (kg)", "טולרנס עליון", "טולרנס תחתון")

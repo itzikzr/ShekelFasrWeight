@@ -21,7 +21,8 @@ class WeighingDetailWindow(tk.Toplevel):
         super().__init__(main.root)
         self.weighing_id = weighing_id
         self.title(f"פירוט שקילה #{weighing_id}")
-        self.geometry("540x680")
+        self.minsize(540, 680)
+        theme.maximize_window(self)
         self.configure(background=theme.BG)
 
         self.weighing = weighing = db.get_weighing(weighing_id)

@@ -208,11 +208,37 @@ def maximize(root):
         pass
 
 
+def maximize_window(win):
+    """
+    מתחיל Toplevel (הגדרות/מוצרים/היסטוריה/פירוט שקילה) ממוקסם — עם שורת כותרת
+    ותפריט מזעור/שחזור/סגירה רגילים, לא fullscreen גולמי בלי שורת כותרת כמו
+    maximize() לחלון הראשי. 'zoomed' עובד ב-Windows; fallback ל-'-zoomed'
+    (Linux/X11) ואז לגיאומטריה מלאה מהמסך אם אף אחת מהן לא נתמכת בבילד הזה.
+    """
+    try:
+        win.state("zoomed")
+        return
+    except tk.TclError:
+        pass
+    try:
+        win.attributes("-zoomed", True)
+        return
+    except tk.TclError:
+        pass
+    try:
+        w = win.winfo_screenwidth()
+        h = win.winfo_screenheight()
+        win.geometry(f"{w}x{h}+0+0")
+    except tk.TclError:
+        pass
+
+
 def set_app_icon(root):
     """
-    מגדיר את אייקון החלון/שורת המשימות מ-scale_app/assets (מקור: Pic/shekel.ico).
-    ל-Windows יש iconbitmap עם .ico (רזולוציות מדויקות לכל גודל תצוגה); כ-fallback
-    חוצה-פלטפורמות (Linux) יש iconphoto עם PNG, שנתמך בכל build של Tk 8.6+.
+    מגדיר את אייקון החלון/שורת המשימות מ-scale_app/assets (מקור: Pic/shekel.ico —
+    לוגו "SHEKEL"). ל-Windows יש iconbitmap עם .ico (רזולוציות מדויקות לכל גודל
+    תצוגה); כ-fallback חוצה-פלטפורמות (Linux) יש iconphoto עם PNG, שנתמך בכל
+    build של Tk 8.6+.
     default=True/True מחיל את האייקון גם על כל Toplevel עתידי (הגדרות/מוצרים/היסטוריה).
     """
     try:
