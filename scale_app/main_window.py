@@ -16,6 +16,7 @@ from pathlib import Path
 
 from . import db, rtl, theme
 from .engine import WeighingEngine, decide_weight
+from .relay_engine import RelayEngine
 from .formatting import fmt_weight
 from .widgets import ColorBar, StatusPill
 from .settings_window import SettingsWindow
@@ -62,6 +63,13 @@ class MainWindow:
 
         self.ui_queue: "queue.Queue" = queue.Queue()
         self.engine = WeighingEngine(self.ui_queue)
+        self.relay_engine = RelayEngine(self.ui_queue)
+        # כניסה1/כניסה2 בכרטיס הממסרים קובעות התחלה/סיום שקילה — ראו
+        # _sync_relay_sensor_mode() (נקרא מכל שינוי במצב "השתמש בממסרים"
+        # ומכל connect/disconnect של הממסרים) ו-engine.EngineSettings.use_relay_sensors.
+        self.relay_engine.on_input1_edge = self.engine.force_start_session
+        self.relay_engine.on_input2_edge = self.engine.force_stop_session
+        self._relay_motor_on = False
 
         self.current_product_id = None
         self._product_name_to_id = {}
@@ -77,6 +85,7 @@ class MainWindow:
 
         self._build_ui()
         self._load_settings()
+        self._sync_relay_ui()
         self.refresh_products()
         self._refresh_recent_list()
         self._pump_queue()
@@ -133,6 +142,9 @@ class MainWindow:
         ttk.Button(btns, text="↺ איפוס", command=self._on_zero_click).pack(side="left", padx=3)
         ttk.Button(btns, text="📦 מוצרים", command=self.open_products).pack(side="left", padx=3)
         ttk.Button(btns, text="⚙ הגדרות", command=self.open_settings).pack(side="left", padx=3)
+        # לא נארז (pack) כאן בכוונה — מוצג רק כש"השתמש בממסרים" מסומן,
+        # ראו _sync_relay_ui() (נקרא אחרי _load_settings ובכל שינוי הגדרה).
+        self.btn_relay_motor = ttk.Button(btns, text="▶ התחל", command=self._on_relay_motor_toggle)
 
         # ── תוכן: שקילות אחרונות משמאל (מלא לגובה) | משקל+רמזור מימין (מלא לגובה) ──
         content = ttk.Frame(outer)
@@ -315,6 +327,14 @@ class MainWindow:
         self.live_window = cfg.get("live_window", 1.0)
         self.current_product_id = cfg.get("product_id")
         self.dark_mode = bool(cfg.get("dark_mode", self.dark_mode))
+        self.relay_enabled = bool(cfg.get("relay_enabled", False))
+        self.relay_port = cfg.get("relay_port", "")
+        self.relay_baud = cfg.get("relay_baud") or "19200"
+        # ברירת מחדל True כדי לא לשנות התנהגות למי שכבר הגדיר relay_enabled
+        # לפני שהצ'קבוקס הזה נוסף — "השתמש בממסרים" בלבד המשיך לתת מצב
+        # חיישנים מלא, כמו קודם.
+        self.relay_use_inputs = bool(cfg.get("relay_use_inputs", True))
+        self.relay_engine.settings.sort_pulse_seconds = cfg.get("relay_sort_pulse_seconds", 2.0)
 
     def save_settings(self):
         cfg = {
@@ -329,6 +349,11 @@ class MainWindow:
             "live_window": self.live_window,
             "product_id": self.current_product_id,
             "dark_mode": self.dark_mode,
+            "relay_enabled": self.relay_enabled,
+            "relay_port": self.relay_port,
+            "relay_baud": self.relay_baud,
+            "relay_use_inputs": self.relay_use_inputs,
+            "relay_sort_pulse_seconds": self.relay_engine.settings.sort_pulse_seconds,
         }
         try:
             CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -371,6 +396,90 @@ class MainWindow:
         self.weight_var.set("---")
         self.traffic.set_state("none")
         self._sync_connect_button()
+
+    # ──────────────────────────────────────────────
+    # Relays (כרטיס IA-3116-U2i — מנוע המסוע + חיישני התחלה/סיום שקילה +
+    # מיון) — חיבור סיריאלי נפרד ועצמאי מהמשקל, ראו relay_engine.py.
+    # ──────────────────────────────────────────────
+
+    def connect_relays(self, port_name: str, baud: str):
+        self.relay_engine.connect(port_name, int(baud))
+        self.relay_port, self.relay_baud = port_name, baud
+        self.save_settings()
+        self._sync_relay_sensor_mode()
+        self._sync_relay_ui()
+
+    def disconnect_relays(self):
+        self.relay_engine.disconnect()
+        self._relay_motor_on = False
+        self._sync_relay_sensor_mode()
+        self._sync_relay_ui()
+
+    def _sync_relay_sensor_mode(self):
+        """
+        active = "השתמש בממסרים" מסומן *וגם* הממסרים בפועל מחוברים — "עובד
+        אז מחליף, לא עובד אז כמו קודם" כפי שהתבקש. בתוך active, "השתמש
+        בכניסות (INPUT)" (relay_use_inputs) בוחר בין שני תת-מצבים:
+          - מסומן: use_relay_sensors — כניסה1/כניסה2 קובעות התחלה/סיום.
+          - לא מסומן: require_armed — סף המשקל הרגיל, אבל התחלת שקילה
+            חדשה דורשת גם armed=True ("התחל" = מפתח הפעלה). ראו
+            engine._monitor_loop. נקרא מכל שינוי בכל אחד מהתנאים האלה.
+        """
+        active = self.relay_enabled and self.relay_engine.connected
+        self.engine.settings.use_relay_sensors = active and self.relay_use_inputs
+        self.engine.settings.require_armed = active and not self.relay_use_inputs
+        self.engine.settings.armed = self._relay_motor_on
+
+    def _sync_relay_ui(self):
+        """ כפתור המסוע מוצג רק כש"השתמש בממסרים" מסומן — כשלא, המסך נראה
+        בדיוק כמו לפני התכונה הזו בכלל. """
+        if self.relay_enabled:
+            if not self.btn_relay_motor.winfo_ismapped():
+                self.btn_relay_motor.pack(side="left", padx=3)
+        else:
+            if self.btn_relay_motor.winfo_ismapped():
+                self.btn_relay_motor.pack_forget()
+        self._sync_relay_motor_button()
+
+    def _sync_relay_motor_button(self):
+        self.btn_relay_motor.config(text="⏹ עצור" if self._relay_motor_on else "▶ התחל")
+
+    def _on_relay_motor_toggle(self):
+        """
+        לחיצה על "התחל" (לא על "עצור") מתחברת אוטומטית את שני ההתקנים אם
+        עוד לא מחוברים — גם המשקל עצמו (self.connect, בדיוק כמו כפתור
+        "התחבר" בכותרת) וגם כרטיס הממסרים (self.connect_relays) — במקום רק
+        להציג הודעת שגיאה ולהפנות להגדרות, "לחיצה על התחל מחברת אותם" כפי
+        שהתבקש. אם אין port שמור בכלל להתקן מסוים, או שהחיבור עצמו נכשל,
+        עדיין מפנים להגדרות/מציגים שגיאה (אין מה להתחבר אליו) ולא מתקדמים
+        להפעלת הממסר. לא נוגעים בחיבור הקיים כשמדובר בלחיצת "עצור".
+        """
+        turning_on = not self._relay_motor_on
+        if turning_on:
+            if not self.engine.connected:
+                if not self.port:
+                    messagebox.showinfo("התחברות", "יש לבחור פורט למשקל בהגדרות לפני ההפעלה.")
+                    self.open_settings()
+                    return
+                try:
+                    self.connect(self.port, self.baud)
+                except Exception as e:
+                    messagebox.showerror("שגיאת חיבור", f"החיבור למשקל נכשל:\n{e}")
+                    return
+            if not self.relay_engine.connected:
+                if not self.relay_port:
+                    messagebox.showinfo("ממסרים", "יש להגדיר פורט לכרטיס הממסרים בהגדרות לפני ההפעלה.")
+                    self.open_settings()
+                    return
+                try:
+                    self.connect_relays(self.relay_port, self.relay_baud)
+                except Exception as e:
+                    messagebox.showerror("ממסרים", f"החיבור לכרטיס הממסרים נכשל:\n{e}")
+                    return
+        self._relay_motor_on = not self._relay_motor_on
+        self.relay_engine.set_relay(1, self._relay_motor_on)
+        self._sync_relay_sensor_mode()
+        self._sync_relay_motor_button()
 
     # ──────────────────────────────────────────────
     # Products
@@ -458,6 +567,10 @@ class MainWindow:
             self.engine.disconnect()
         except Exception:
             pass
+        try:
+            self.relay_engine.disconnect()
+        except Exception:
+            pass
         self.root.destroy()
 
     # ──────────────────────────────────────────────
@@ -479,13 +592,23 @@ class MainWindow:
                     self._on_session_done(*payload)
                 elif kind == "monitor_stopped":
                     pass
+                elif kind == "relay_connection_lost":
+                    # הפורט נפל תוך כדי polling (לא ניתוק מכוון) — מפילים חזרה
+                    # למצב סף-משקל הרגיל אוטומטית, "לא עובד אז כמו קודם".
+                    # מצב "התחל"/armed מתאפס — לא ידוע אם ממסר 1 עוד דלוק
+                    # בפועל אחרי שהפורט נפל, ואין דרך לשלוח לו כיבוי.
+                    self._relay_motor_on = False
+                    self._sync_relay_sensor_mode()
+                    self._sync_relay_ui()
+                    if self.settings_window is not None and self.settings_window.winfo_exists():
+                        self.settings_window.handle_engine_event(kind, payload)
                 else:
                     # device_zero יכול לבוא גם מכפתור "איפוס" בכותרת (מטופל כאן)
                     # וגם מטאב "תצורת משקל" בהגדרות (מטופל שם) — שני הצרכנים
                     # מקבלים את האירוע, ה-guard ב-_on_zero_result מונע resume כפול.
                     if kind == "device_zero":
                         self._on_zero_result(payload)
-                    # אירועי דיאגנוסטיקה/כיול/תצורת משקל — רלוונטיים רק אם מסך ההגדרות פתוח
+                    # אירועי דיאגנוסטיקה/כיול/תצורת משקל/ממסרים — רלוונטיים רק אם מסך ההגדרות פתוח
                     if self.settings_window is not None and self.settings_window.winfo_exists():
                         self.settings_window.handle_engine_event(kind, payload)
                     if kind in ("calib_disconnect", "device_reset_disconnect"):
@@ -514,6 +637,9 @@ class MainWindow:
         self.status_line_var.set(
             f"הושלם: {fmt_weight(decided)} kg   {VERDICT_TEXT[verdict]}   "
             f"({count} קריאות, {elapsed:.1f}s)")
+
+        if self.relay_enabled and self.relay_engine.connected:
+            self.relay_engine.activate_sort_relay(verdict)
 
         product_name = product["name"] if product else NO_PRODUCT_LABEL
         self._add_recent_row(row_id, wall_end, product_name, decided, verdict, count, elapsed)

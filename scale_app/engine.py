@@ -103,6 +103,21 @@ class EngineSettings:
         self.debounce_s = 0.4       # שניות מתחת לסף לפני סיום שקילה
         self.show_each = True       # האם לשדר ל-log כל קריאה בודדת (דיאגנוסטיקה)
         self.min_save_weight = 0.0  # kg — משקל שהוחלט מתחתיו לא נשמר ל-DB
+        # True = כניסה1/כניסה2 בכרטיס הממסרים קובעות התחלה/סיום שקילה (ראו
+        # force_start_session/force_stop_session), במקום סף המשקל. MainWindow
+        # מדליק את זה רק כשגם "השתמש בממסרים" מסומן, גם כרטיס הממסרים באמת
+        # מחובר וגם "השתמש בכניסות (INPUT)" מסומן — "עובד אז מחליף, לא עובד
+        # אז כמו קודם" (בקשת המשתמש).
+        self.use_relay_sensors = False
+        # True = ממסרים מחוברים ופעילים אבל "השתמש בכניסות (INPUT)" *לא*
+        # מסומן — משתמשים בסף המשקל הרגיל, אבל התחלת שקילה חדשה דורשת גם
+        # armed=True ("כפתור התחל הוא מפתח הפעלה", לא רק סף משקל תמיד-פעיל).
+        # ממסרי המיון (2-4) עדיין פועלים כרגיל בסוף שקילה, בלי קשר לזה.
+        self.require_armed = False
+        # True בזמן שהמנוע (ממסר 1) דלוק — כלומר המפעיל לחץ "התחל". נקרא רק
+        # כש-require_armed פעיל; לא משפיע במצב חיישנים (use_relay_sensors) או
+        # במצב הרגיל (לא ממסרים בכלל).
+        self.armed = False
 
 
 class WeighingEngine:
@@ -122,6 +137,22 @@ class WeighingEngine:
         self._calib_event = threading.Event()
 
         self._device_busy = False
+
+        # דגלים בוליאניים פשוטים, לא Tk — נכתבים מ-RelayEngine._poll_loop
+        # (thread נפרד) ונקראים כל טיק ע"י _monitor_loop, בדיוק כמו
+        # EngineSettings; בטוח בלי lock כי אלה קריאה/כתיבה אטומיות של bool.
+        self._pending_force_start = False
+        self._pending_force_stop = False
+
+    def force_start_session(self):
+        """ נקרא מ-RelayEngine (thread נפרד) כשכניסה1 מסמנת שהקופסה כולה על
+        המשטח. נלקח בחשבון רק כש-settings.use_relay_sensors פעיל. """
+        self._pending_force_start = True
+
+    def force_stop_session(self):
+        """ נקרא מ-RelayEngine (thread נפרד) כשכניסה2 מסמנת שהקופסה מתחילה
+        לצאת. נלקח בחשבון רק כש-settings.use_relay_sensors פעיל. """
+        self._pending_force_stop = True
 
     # ──────────────────────────────────────────────
     # Connection
@@ -321,8 +352,23 @@ class WeighingEngine:
                     threshold  = self.settings.threshold
                     debounce_s = self.settings.debounce_s
 
+                    sensor_mode = self.settings.use_relay_sensors
+
                     if state == "IDLE":
-                        if w > threshold:
+                        # במצב חיישנים, כניסה1 (RelayEngine.on_input1_edge ->
+                        # force_start_session) מחליפה את בדיקת הסף — לא בודקים
+                        # w בכלל, בדיוק כמו שהתבקש ("עובד אז מחליף").
+                        if sensor_mode:
+                            start_now = self._pending_force_start
+                        else:
+                            # require_armed: ממסרים מחוברים אבל "השתמש
+                            # בכניסות" לא מסומן — סף המשקל הרגיל, אבל רק
+                            # כשהמפעיל לחץ "התחל" (armed=True). לא ממסרים
+                            # בכלל -> require_armed=False -> בדיוק כמו קודם.
+                            gate_ok = (not self.settings.require_armed) or self.settings.armed
+                            start_now = gate_ok and (w > threshold)
+                        if start_now:
+                            self._pending_force_start = False
                             state = "WEIGHING"
                             session_start = now
                             session_wall_start = datetime.datetime.now()
@@ -341,7 +387,19 @@ class WeighingEngine:
                                                f"{t_sess:6.3f}s   "
                                                f"{fmt_weight(w, force_sign=True):>10}", "reading"))
 
-                        if w <= threshold:
+                        # ממשיכים לצבור readings בשני המצבים (decide_weight
+                        # צריך אותם) — רק תנאי הסיום עצמו משתנה.
+                        if sensor_mode:
+                            if self._pending_force_stop:
+                                self._pending_force_stop = False
+                                elapsed = now - session_start
+                                state = "IDLE"
+                                self._emit("session_done",
+                                           (session_readings, elapsed, session_wall_start,
+                                            datetime.datetime.now()))
+                                session_readings = []
+                                below_since = None
+                        elif w <= threshold:
                             if below_since is None:
                                 below_since = now
                             elif (now - below_since) >= debounce_s:

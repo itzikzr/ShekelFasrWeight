@@ -40,12 +40,14 @@ class SettingsWindow(tk.Toplevel):
         nb = self.nb
 
         self.tab_conn  = ttk.Frame(nb, padding=14)
+        self.tab_relay = ttk.Frame(nb, padding=14)
         self.tab_weigh = ttk.Frame(nb, padding=14)
         self.tab_diag  = ttk.Frame(nb, padding=14)
         self.tab_device_info = ttk.Frame(nb, padding=14)
         self.tab_scale_config = ttk.Frame(nb, padding=14)
         self.tab_factory_reset = ttk.Frame(nb, padding=14)
         nb.add(self.tab_conn, text="חיבור")
+        nb.add(self.tab_relay, text="ממסרים")
         nb.add(self.tab_weigh, text="שקילה")
         nb.add(self.tab_diag, text="דיאגנוסטיקה")
         nb.add(self.tab_device_info, text="פרטי מכשיר")
@@ -53,6 +55,7 @@ class SettingsWindow(tk.Toplevel):
         nb.add(self.tab_factory_reset, text="איפוס יצרן")
 
         self._build_connection_tab()
+        self._build_relay_tab()
         self._build_weighing_tab()
         self._build_diagnostics_tab()
         self._build_device_info_tab()
@@ -159,6 +162,132 @@ class SettingsWindow(tk.Toplevel):
         except Exception as e:
             messagebox.showerror("שגיאה", str(e))
             self.autostart_var.set(autostart.is_enabled())
+
+    # ──────────────────────────────────────────────
+    # ממסרים (כרטיס IA-3116-U2i) — חיבור סיריאלי נפרד ועצמאי מהמשקל.
+    # ──────────────────────────────────────────────
+
+    def _build_relay_tab(self):
+        t = self.tab_relay
+        pad = {"padx": 6, "pady": 6}
+
+        self.relay_enabled_var = tk.BooleanVar(value=self.main.relay_enabled)
+        ttk.Checkbutton(t, text="השתמש בממסרים", variable=self.relay_enabled_var,
+                        command=self._on_relay_enabled_toggle).grid(
+            row=0, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Label(t, text="מנוע המסוע (ממסר 1), חיישני התחלה/סיום שקילה "
+                          "(כניסות 1-2) ומיון לפי תוצאה (ממסרים 2-4).",
+                  style="Muted.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", **pad)
+
+        self.relay_use_inputs_var = tk.BooleanVar(value=self.main.relay_use_inputs)
+        ttk.Checkbutton(t, text="השתמש בכניסות (INPUT) לכניסה/יציאה",
+                        variable=self.relay_use_inputs_var,
+                        command=self._on_relay_use_inputs_toggle).grid(
+            row=2, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Label(t, text="לא מסומן: התחלת שקילה חוזרת לסף המשקל הרגיל, אבל רק "
+                          "אחרי לחיצה על \"התחל\" (מפתח הפעלה) — ממסרי המיון "
+                          "ממשיכים לפעול כרגיל בסוף כל שקילה.",
+                  style="Muted.TLabel").grid(row=3, column=0, columnspan=3, sticky="w", **pad)
+
+        ttk.Separator(t, orient="horizontal").grid(
+            row=4, column=0, columnspan=3, sticky="ew", pady=(6, 6))
+
+        ttk.Label(t, text="Port:").grid(row=5, column=0, sticky="e", **pad)
+        self.relay_port_var = tk.StringVar(value=self.main.relay_port)
+        self.relay_port_combo = ttk.Combobox(t, textvariable=self.relay_port_var,
+                                             width=30, state="readonly")
+        self.relay_port_combo.grid(row=5, column=1, **pad)
+        ttk.Button(t, text="⟳", width=3, command=self._refresh_relay_ports).grid(
+            row=5, column=2, **pad)
+
+        ttk.Label(t, text="Baud:").grid(row=6, column=0, sticky="e", **pad)
+        self.relay_baud_var = tk.StringVar(value=self.main.relay_baud)
+        ttk.Combobox(t, textvariable=self.relay_baud_var, state="readonly", width=10,
+                     values=["1200", "2400", "4800", "9600", "19200", "38400",
+                             "57600", "115200"]).grid(row=6, column=1, sticky="w", **pad)
+
+        self.relay_status_var = tk.StringVar()
+        ttk.Label(t, textvariable=self.relay_status_var,
+                  style="Muted.TLabel").grid(row=7, column=0, columnspan=3, sticky="w", **pad)
+
+        relay_btn_frame = ttk.Frame(t)
+        relay_btn_frame.grid(row=8, column=0, columnspan=3, sticky="w", **pad)
+        self.btn_relay_connect = ttk.Button(relay_btn_frame, text="התחבר",
+                                            style="Accent.TButton", command=self._on_relay_connect)
+        self.btn_relay_connect.pack(side="left", padx=4)
+        self.btn_relay_disconnect = ttk.Button(relay_btn_frame, text="התנתק",
+                                               command=self._on_relay_disconnect)
+        self.btn_relay_disconnect.pack(side="left", padx=4)
+
+        ttk.Separator(t, orient="horizontal").grid(
+            row=9, column=0, columnspan=3, sticky="ew", pady=(10, 6))
+
+        ttk.Label(t, text="זמן הפעלת ממסר מיון (שניות):").grid(row=10, column=0, sticky="e", **pad)
+        self.relay_pulse_var = tk.DoubleVar(value=self.main.relay_engine.settings.sort_pulse_seconds)
+        ttk.Spinbox(t, textvariable=self.relay_pulse_var, from_=0.2, to=30.0,
+                    increment=0.1, width=8, format="%.1f").grid(row=10, column=1, sticky="w", **pad)
+        ttk.Label(t, text="ממסר המיון נכבה קודם זמן זה אם מיון חדש מתחיל",
+                  style="Muted.TLabel").grid(row=11, column=0, columnspan=2, sticky="w", **pad)
+        self.relay_pulse_var.trace_add("write", lambda *a: self._apply_relay_pulse_duration())
+
+        self._refresh_relay_ports()
+        self._sync_relay_connection_state()
+
+    def _refresh_relay_ports(self):
+        ports = engine_mod.list_serial_ports()
+        values = [f"{dev} | {desc}" for dev, desc in ports] if ports else ["(לא נמצאו פורטים)"]
+        self.relay_port_combo.config(values=values)
+        if self.main.relay_port:
+            for v in values:
+                if v.startswith(self.main.relay_port):
+                    self.relay_port_var.set(v)
+                    return
+        if values:
+            self.relay_port_combo.current(0)
+
+    def _sync_relay_connection_state(self):
+        connected = self.main.relay_engine.connected
+        self.relay_status_var.set("מחובר" if connected else "מנותק")
+        self.btn_relay_connect.config(state="disabled" if connected else "normal")
+        self.btn_relay_disconnect.config(state="normal" if connected else "disabled")
+        self.relay_port_combo.config(state="disabled" if connected else "readonly")
+
+    def _on_relay_enabled_toggle(self):
+        self.main.relay_enabled = self.relay_enabled_var.get()
+        self.main.save_settings()
+        self.main._sync_relay_sensor_mode()
+        self.main._sync_relay_ui()
+
+    def _on_relay_use_inputs_toggle(self):
+        self.main.relay_use_inputs = self.relay_use_inputs_var.get()
+        self.main.save_settings()
+        self.main._sync_relay_sensor_mode()
+
+    def _on_relay_connect(self):
+        if not engine_mod.SERIAL_AVAILABLE:
+            messagebox.showerror("שגיאה", "pyserial לא מותקן — הרץ: pip install pyserial")
+            return
+        port_name = self.relay_port_var.get().split("|")[0].strip()
+        if not port_name or port_name.startswith("("):
+            messagebox.showerror("שגיאה", "לא נבחר פורט תקין — לחץ ⟳ לרענון")
+            return
+        try:
+            self.main.connect_relays(port_name, self.relay_baud_var.get())
+        except Exception as e:
+            messagebox.showerror("שגיאת חיבור", str(e))
+            return
+        self._sync_relay_connection_state()
+
+    def _on_relay_disconnect(self):
+        self.main.disconnect_relays()
+        self._sync_relay_connection_state()
+
+    def _apply_relay_pulse_duration(self):
+        try:
+            self.main.relay_engine.settings.sort_pulse_seconds = float(self.relay_pulse_var.get())
+        except (tk.TclError, ValueError):
+            return
+        self.main.save_settings()
 
     # ──────────────────────────────────────────────
     # שקילה
@@ -572,6 +701,13 @@ class SettingsWindow(tk.Toplevel):
         elif kind == "calib":
             if self._calib_dialog is not None and self._calib_dialog.winfo_exists():
                 self._calib_dialog.handle_update(*payload)
+        elif kind in ("relay_connected", "relay_disconnected", "relay_connection_lost"):
+            self._sync_relay_connection_state()
+            if kind == "relay_connection_lost":
+                messagebox.showerror("ממסרים", "החיבור לכרטיס הממסרים אבד — "
+                                      "חזרה אוטומטית למצב סף-משקל.")
+        elif kind == "relay_error":
+            self.relay_status_var.set(f"מחובר — שגיאה אחרונה: {payload}")
         elif kind in ("device_full_scale", "device_full_scale_set"):
             if payload.get("ok"):
                 self.full_scale_var.set(f"{payload['grams'] / 1000:.3f}")
