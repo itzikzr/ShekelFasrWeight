@@ -6,7 +6,7 @@ import sqlite3
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from . import db, theme
+from . import db, rtl, theme
 
 
 class ProductsWindow(tk.Toplevel):
@@ -105,9 +105,20 @@ class ProductFormDialog(tk.Toplevel):
         self.focus_set()
         self.configure(background=theme.BG)
 
+        # The Entry itself isn't bidi-patched (unlike Label/Button text) since
+        # it's editable and its value is read back to write the DB — see
+        # rtl.py. Pre-filling it with the reordered name for correct display
+        # would corrupt the stored name on save if the user clicks Save
+        # without retyping, so _on_save() detects "unchanged" and substitutes
+        # back the real original_name. On Windows both strings are identical
+        # and this is a no-op.
+        self._original_name = product["name"] if product else ""
+        prefilled_display_name = rtl.visual(self._original_name)
+        self._prefilled_display_name = prefilled_display_name
+
         pad = {"padx": 8, "pady": 8}
         ttk.Label(self, text="שם מוצר:").grid(row=0, column=0, sticky="e", **pad)
-        self.name_var = tk.StringVar(value=product["name"] if product else "")
+        self.name_var = tk.StringVar(value=prefilled_display_name)
         ttk.Entry(self, textvariable=self.name_var, width=26).grid(row=0, column=1, **pad)
 
         ttk.Label(self, text="משקל מטרה (kg):").grid(row=1, column=0, sticky="e", **pad)
@@ -133,6 +144,8 @@ class ProductFormDialog(tk.Toplevel):
 
     def _on_save(self):
         name = self.name_var.get().strip()
+        if name == self._prefilled_display_name.strip() and self._original_name:
+            name = self._original_name
         if not name:
             messagebox.showerror("שגיאה", "יש להזין שם מוצר")
             return

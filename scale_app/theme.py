@@ -117,24 +117,33 @@ def apply_theme(root):
     style.configure("Muted.TLabel", background=BG, foreground=TEXT_MUTED)
     style.configure("Card.Muted.TLabel", background=CARD_BG, foreground=TEXT_MUTED)
 
-    style.configure("TButton", font=(f["sans"], 10), padding=6)
+    # Padding sized for touch (finger-sized targets), not just mouse — this
+    # is a touchscreen kiosk app. Centralized here rather than per-button,
+    # since every ttk button/tab/row in the app reads from this one style.
+    style.configure("TButton", font=(f["sans"], 10), padding=(16, 10))
     style.configure("Accent.TButton", font=(f["sans"], 10, "bold"))
     style.map("Accent.TButton",
               background=[("!disabled", ACCENT)],
               foreground=[("!disabled", "#ffffff")])
 
     style.configure("Treeview", background=CARD_BG, fieldbackground=CARD_BG,
-                     foreground=TEXT, rowheight=26, font=(f["sans"], 10))
-    style.configure("Treeview.Heading", font=(f["sans"], 10, "bold"))
+                     foreground=TEXT, rowheight=36, font=(f["sans"], 10))
+    style.configure("Treeview.Heading", font=(f["sans"], 10, "bold"), padding=(8, 8))
 
     style.configure("TNotebook", background=BG, borderwidth=0)
-    style.configure("TNotebook.Tab", font=(f["sans"], 10), padding=(14, 6))
+    style.configure("TNotebook.Tab", font=(f["sans"], 10), padding=(20, 12))
 
-    style.configure("TCombobox", fieldbackground=CARD_BG, background=CARD_BG, foreground=TEXT)
-    style.configure("TEntry", fieldbackground=CARD_BG, foreground=TEXT)
-    style.configure("TSpinbox", fieldbackground=CARD_BG, foreground=TEXT)
-    style.configure("TCheckbutton", background=BG, foreground=TEXT)
-    style.configure("TRadiobutton", background=BG, foreground=TEXT)
+    style.configure("TCombobox", fieldbackground=CARD_BG, background=CARD_BG, foreground=TEXT,
+                     padding=(8, 8))
+    style.configure("TEntry", fieldbackground=CARD_BG, foreground=TEXT, padding=(8, 8))
+    style.configure("TSpinbox", fieldbackground=CARD_BG, foreground=TEXT, padding=(8, 6))
+    style.configure("TCheckbutton", background=BG, foreground=TEXT, padding=(4, 8))
+    style.configure("TRadiobutton", background=BG, foreground=TEXT, padding=(4, 8))
+
+    # ttk's default scrollbar trough/thumb is mouse-width — too thin to grab
+    # reliably with a finger.
+    style.configure("Vertical.TScrollbar", arrowsize=24, width=24)
+    style.configure("Horizontal.TScrollbar", arrowsize=24, width=24)
 
     return f
 

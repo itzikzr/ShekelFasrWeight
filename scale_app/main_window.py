@@ -10,18 +10,18 @@
 import json
 import queue
 import tkinter as tk
+from datetime import datetime, timedelta
 from tkinter import ttk, messagebox
 from pathlib import Path
 
-from . import db, theme
+from . import db, rtl, theme
 from .engine import WeighingEngine, decide_weight
 from .formatting import fmt_weight
-from .widgets import TrafficLight, StatusPill
+from .widgets import ColorBar, StatusPill
 from .settings_window import SettingsWindow
 from .products_window import ProductsWindow
 from .history_window import HistoryWindow
 from .weighing_detail_window import WeighingDetailWindow
-from .scale_config_window import ScaleConfigWindow
 from .version import __version__
 
 CONFIG_FILE = Path(__file__).resolve().parent.parent / "scale_sampler_config.json"
@@ -34,6 +34,14 @@ VERDICT_TEXT = {
     "yellow": "⚠ מתחת לטווח",
     "none":   "—",
 }
+
+# סינון "שקילות אחרונות" לפי טווח זמן — (מפתח פנימי, תווית תצוגה).
+RECENT_FILTERS = [
+    ("today", "היום"),
+    ("week", "השבוע"),
+    ("session", "מאז ההפעלה"),
+]
+RECENT_FILTER_LABEL_TO_KEY = {label: key for key, label in RECENT_FILTERS}
 
 
 class MainWindow:
@@ -57,16 +65,20 @@ class MainWindow:
 
         self.current_product_id = None
         self._product_name_to_id = {}
+        self._display_to_name = {}
+
+        self._app_start_time = datetime.now()
+        self._recent_filter = "today"
+        self._recent_cleared_at = None
 
         self.settings_window = None
         self.products_window = None
         self.history_window = None
-        self.scale_config_window = None
 
         self._build_ui()
         self._load_settings()
         self.refresh_products()
-        self._load_recent_from_db()
+        self._refresh_recent_list()
         self._pump_queue()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -118,21 +130,9 @@ class MainWindow:
 
         btns = ttk.Frame(header, style="Card.TFrame")
         btns.pack(side="left", padx=4)
-        ttk.Button(btns, text="📜 היסטוריה", command=self.open_history).pack(side="left", padx=3)
+        ttk.Button(btns, text="↺ איפוס", command=self._on_zero_click).pack(side="left", padx=3)
         ttk.Button(btns, text="📦 מוצרים", command=self.open_products).pack(side="left", padx=3)
-        ttk.Button(btns, text="🛠 תצורת משקל", command=self.open_scale_config).pack(side="left", padx=3)
         ttk.Button(btns, text="⚙ הגדרות", command=self.open_settings).pack(side="left", padx=3)
-
-        prod_frame = ttk.Frame(header, style="Card.TFrame")
-        prod_frame.pack(side="left", padx=16)
-        self.product_caption_label = tk.Label(prod_frame, text="מוצר:", background=theme.CARD_BG,
-                                               foreground=theme.TEXT)
-        self.product_caption_label.pack(side="right", padx=(0, 6))
-        self.product_var = tk.StringVar(value=NO_PRODUCT_LABEL)
-        self.product_combo = ttk.Combobox(prod_frame, textvariable=self.product_var,
-                                          state="readonly", width=22)
-        self.product_combo.pack(side="right")
-        self.product_combo.bind("<<ComboboxSelected>>", self._on_product_selected)
 
         # ── תוכן: שקילות אחרונות משמאל (מלא לגובה) | משקל+רמזור מימין (מלא לגובה) ──
         content = ttk.Frame(outer)
@@ -153,12 +153,13 @@ class MainWindow:
         # עדיין מותח אותו לגובה המלא.
         right_panel.pack_propagate(False)
 
-        # pack(expand=True) ולא place() בכוונה: place() לא מדווח את הגודל הטבעי שלו
-        # להורה, כך שה-grid החוצה היה מקצה ל-right_panel שטח מזערי ותוכן הפנים
-        # (המשקל בגופן גדול) היה נחתך מעבר לגבול החלון. pack עם expand מרכז בדיוק
-        # אותו הדבר, אבל מדווח נכון את הגודל הנדרש כלפי מעלה.
+        # pack() ולא place() בכוונה: place() לא מדווח את הגודל הטבעי שלו להורה,
+        # כך שה-grid החוצה היה מקצה ל-right_panel שטח מזערי ותוכן הפנים (המשקל
+        # בגופן גדול) היה נחתך מעבר לגבול החלון. pack מדווח נכון את הגודל הנדרש
+        # כלפי מעלה. לא expand=True יותר — מרותק לראש הפאנל כדי שטבלת סיכום
+        # המוצרים למטה (ראו summary_frame) תקבל את שאר השטח הפנוי.
         right_inner = ttk.Frame(right_panel, style="Card.TFrame")
-        right_inner.pack(expand=True)
+        right_inner.pack(pady=(24, 8))
 
         self.weight_var = tk.StringVar(value="---")
         self.weight_caption_label = tk.Label(right_inner, text="משקל נוכחי", font=(f["sans"], 11),
@@ -169,21 +170,69 @@ class MainWindow:
                                      background=theme.CARD_BG, foreground=theme.ACCENT)
         self.weight_label.pack()
 
-        self.traffic = TrafficLight(right_inner, size=110)
+        # מלבן צבעוני רחב (בערך ברוחב תצוגת המשקל) שמחליף את הרמזור התלת-נורתי —
+        # רק הצבע משתנה, בלי הטקסט/ההערות שהיו מתחתיו קודם. status_line_var
+        # נשאר קיים ומתעדכן (משמש מקומות אחרים בעתיד/דיבוג) אבל לא מוצג יותר.
+        self.traffic = ColorBar(right_inner, width=RIGHT_PANEL_WIDTH - 80, height=40)
         self.traffic.pack(pady=18)
 
         self.status_line_var = tk.StringVar(value="מנותק — פתח הגדרות להתחברות")
-        self.status_line_label = tk.Label(right_inner, textvariable=self.status_line_var,
-                                          font=(f["sans"], 12), wraplength=RIGHT_PANEL_WIDTH - 60,
-                                          justify="center",
-                                          background=theme.CARD_BG, foreground=theme.TEXT)
-        self.status_line_label.pack()
+
+        # ── סיכום מוצרים: אותו טווח/מסנן זמן כמו "שקילות אחרונות" משמאל ──
+        summary_frame = ttk.Frame(right_panel, style="Card.TFrame")
+        summary_frame.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        summary_frame.columnconfigure(0, weight=1)
+        summary_frame.rowconfigure(1, weight=1)
+
+        ttk.Label(summary_frame, text="סיכום מוצרים", style="Card.TLabel",
+                  font=(f["sans"], 11, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+        summary_cols = ("#", "מוצר", "תקין", "מעל", "מתחת", 'סה"כ')
+        self.product_summary_tree = ttk.Treeview(summary_frame, columns=summary_cols,
+                                                 show="headings", height=5)
+        summary_widths = {"#": 32, "מוצר": 170}
+        for c in summary_cols:
+            self.product_summary_tree.heading(c, text=c)
+            self.product_summary_tree.column(c, width=summary_widths.get(c, 55),
+                                             anchor="center", stretch=True)
+        self.product_summary_tree.grid(row=1, column=0, sticky="nsew")
+
+        summary_sb = ttk.Scrollbar(summary_frame, orient="vertical",
+                                   command=self.product_summary_tree.yview)
+        self.product_summary_tree.configure(yscrollcommand=summary_sb.set)
+        summary_sb.grid(row=1, column=1, sticky="ns")
 
         # ── שמאל: שקילות אחרונות, מלא לגובה ──
         recent = ttk.LabelFrame(content, text="שקילות אחרונות")
         recent.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         recent.columnconfigure(0, weight=1)
-        recent.rowconfigure(0, weight=1)
+        recent.rowconfigure(1, weight=1)
+
+        toolbar = ttk.Frame(recent)
+        toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 0))
+        ttk.Button(toolbar, text="נקה תצוגה", command=self._on_clear_recent_display).pack(side="left")
+
+        self.product_var = tk.StringVar(value=NO_PRODUCT_LABEL)
+        self.product_combo = ttk.Combobox(toolbar, textvariable=self.product_var,
+                                          state="readonly", width=18)
+        self.product_combo.pack(side="left", padx=(10, 6))
+        self.product_combo.bind("<<ComboboxSelected>>", self._on_product_selected)
+        ttk.Label(toolbar, text="מוצר:").pack(side="left")
+
+        # Same display/logical split as product_combo (see rtl.py): the combobox
+        # shows bidi-reordered labels, but the filter key lookup must use the
+        # original label — translate the read-back selection through the map.
+        display_filter_values = [rtl.visual(label) for _, label in RECENT_FILTERS]
+        self._recent_display_to_key = {
+            rtl.visual(label): key for key, label in RECENT_FILTERS}
+        self.recent_filter_var = tk.StringVar(
+            value=rtl.visual(dict(RECENT_FILTERS).get(self._recent_filter, RECENT_FILTERS[0][1])))
+        self.recent_filter_combo = ttk.Combobox(
+            toolbar, textvariable=self.recent_filter_var, state="readonly", width=14,
+            values=display_filter_values)
+        self.recent_filter_combo.pack(side="right")
+        self.recent_filter_combo.bind("<<ComboboxSelected>>", self._on_recent_filter_changed)
+        ttk.Label(toolbar, text="הצג:").pack(side="right", padx=(0, 4))
 
         cols = ("#", "שעה", "מוצר", "משקל (kg)", "תוצאה", "קריאות", "משך")
         self.recent_tree = ttk.Treeview(recent, columns=cols, show="headings")
@@ -192,18 +241,18 @@ class MainWindow:
                              ("קריאות", 70, "center"), ("משך", 70, "center")):
             self.recent_tree.heading(c, text=c)
             self.recent_tree.column(c, width=w, anchor=anchor, stretch=(c == "מוצר"))
-        self.recent_tree.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=8)
+        self.recent_tree.grid(row=1, column=0, sticky="nsew", padx=(8, 0), pady=8)
         self.recent_tree.bind("<Double-1>", self._on_recent_double_click)
 
         sb = ttk.Scrollbar(recent, orient="vertical", command=self.recent_tree.yview)
         self.recent_tree.configure(yscrollcommand=sb.set)
-        sb.grid(row=0, column=1, sticky="ns", pady=8)
+        sb.grid(row=1, column=1, sticky="ns", pady=8)
 
         for verdict, (fg, bg) in theme.VERDICT_COLORS.items():
             self.recent_tree.tag_configure(verdict, background=bg, foreground=fg)
 
         footer = ttk.Frame(recent)
-        footer.grid(row=1, column=0, columnspan=2, sticky="e", padx=8, pady=(0, 8))
+        footer.grid(row=2, column=0, columnspan=2, sticky="e", padx=8, pady=(0, 8))
         ttk.Button(footer, text="הצג את כל ההיסטוריה →", command=self.open_history).pack()
 
     # ──────────────────────────────────────────────
@@ -224,14 +273,11 @@ class MainWindow:
         self.btn_theme_toggle.config(text=self._theme_toggle_label())
 
         for label in (self.logo_label, self.version_label,
-                      self.product_caption_label, self.weight_caption_label,
-                      self.weight_label, self.status_line_label):
+                      self.weight_caption_label, self.weight_label):
             label.configure(background=theme.CARD_BG)
         self.version_label.configure(foreground=theme.TEXT_MUTED)
-        self.product_caption_label.configure(foreground=theme.TEXT)
         self.weight_caption_label.configure(foreground=theme.TEXT_MUTED)
         self.weight_label.configure(foreground=theme.ACCENT)
-        self.status_line_label.configure(foreground=theme.TEXT)
 
         self.status_pill.refresh_theme()
         self.status_pill.set(*(("מחובר", theme.GREEN) if self.engine.connected
@@ -241,8 +287,7 @@ class MainWindow:
         for verdict, (fg, bg) in theme.VERDICT_COLORS.items():
             self.recent_tree.tag_configure(verdict, background=bg, foreground=fg)
 
-        for win in (self.settings_window, self.products_window, self.history_window,
-                    self.scale_config_window):
+        for win in (self.settings_window, self.products_window, self.history_window):
             if win is not None and win.winfo_exists():
                 win.refresh_theme()
 
@@ -256,7 +301,11 @@ class MainWindow:
         except Exception:
             cfg = {}
         self.port = cfg.get("port", "")
-        self.baud = cfg.get("baud", "9600")
+        # "or" ולא .get(key, default) בכוונה: אם הקובץ מכיל "baud": "" (ריק, לא
+        # חסר) — למשל אחרי כתיבה חלקית/פגומה — .get היה מחזיר את הריק כי המפתח
+        # קיים, וה-Combobox היה נראה ריק ו-int(baud) ב-connect() היה קורס
+        # (ValueError: invalid literal for int() with base 10: ''). נצפה בפועל.
+        self.baud = cfg.get("baud") or "9600"
         self.engine.settings.listen = cfg.get("listen", True)
         self.engine.settings.threshold = cfg.get("threshold", 0.5)
         self.engine.settings.debounce_s = cfg.get("debounce_s", 0.4)
@@ -331,17 +380,26 @@ class MainWindow:
         products = db.list_products()
         self._product_name_to_id = {p["name"]: p["id"] for p in products}
         values = [NO_PRODUCT_LABEL] + [p["name"] for p in products]
-        self.product_combo.config(values=values)
+        # Combobox values are rendered by Tk itself (not routed through
+        # rtl.patch()'s "text" hook), so they need bidi-reordering here —
+        # but self.product_var / self._product_name_to_id must keep the
+        # original (logical) names, since _on_product_selected looks the
+        # selection up by exact string match. _display_to_name bridges the
+        # two: a no-op dict on Windows, a real reverse-map on Linux.
+        display_values = [rtl.visual(v) for v in values]
+        self._display_to_name = dict(zip(display_values, values))
+        self.product_combo.config(values=display_values)
 
         name_by_id = {p["id"]: p["name"] for p in products}
         if self.current_product_id in name_by_id:
-            self.product_var.set(name_by_id[self.current_product_id])
+            self.product_var.set(rtl.visual(name_by_id[self.current_product_id]))
         else:
             self.current_product_id = None
-            self.product_var.set(NO_PRODUCT_LABEL)
+            self.product_var.set(rtl.visual(NO_PRODUCT_LABEL))
 
     def _on_product_selected(self, _event=None):
-        name = self.product_var.get()
+        display_name = self.product_var.get()
+        name = self._display_to_name.get(display_name, display_name)
         self.current_product_id = self._product_name_to_id.get(name)
         self.save_settings()
 
@@ -370,12 +428,30 @@ class MainWindow:
             self.history_window.lift()
             self.history_window.focus_set()
 
-    def open_scale_config(self):
-        if self.scale_config_window is None or not self.scale_config_window.winfo_exists():
-            self.scale_config_window = ScaleConfigWindow(self)
+    def _settings_device_tab_active(self):
+        """ True אם הגדרות פתוחות וכרגע על טאב "תצורת משקל"/"איפוס יצרן" — שכבר
+        עצר את המוניטור בעצמו (pause_device_access), ראו SettingsWindow._on_tab_changed. """
+        return (self.settings_window is not None and self.settings_window.winfo_exists()
+                and self.settings_window._device_tab_active)
+
+    def _on_zero_click(self):
+        if not self.engine.connected:
+            return
+        # אם טאב תצורת המשקל בהגדרות כבר פעיל, הוא כבר עצר את המוניטור בעצמו
+        # ויחזיר אותו כשיצא ממנו/יסגור — אין לגעת ב-pause/resume כאן, רק לשלוח
+        # את הפקודה, אחרת נוציא אותה ממצב "מושתק" באמצע שהוא עדיין פעיל.
+        if not self._settings_device_tab_active():
+            self.engine.pause_device_access()
+        self.engine.zero()
+
+    def _on_zero_result(self, payload):
+        if self._settings_device_tab_active():
+            return
+        self.engine.resume_after_device_access()
+        if payload.get("ok"):
+            messagebox.showinfo("איפוס", "האיפוס בוצע בהצלחה")
         else:
-            self.scale_config_window.lift()
-            self.scale_config_window.focus_set()
+            messagebox.showerror("שגיאה", payload.get("error", "האיפוס נכשל"))
 
     def _on_close(self):
         try:
@@ -404,13 +480,14 @@ class MainWindow:
                 elif kind == "monitor_stopped":
                     pass
                 else:
-                    # אירועי דיאגנוסטיקה/כיול — רלוונטיים רק אם מסך ההגדרות פתוח
+                    # device_zero יכול לבוא גם מכפתור "איפוס" בכותרת (מטופל כאן)
+                    # וגם מטאב "תצורת משקל" בהגדרות (מטופל שם) — שני הצרכנים
+                    # מקבלים את האירוע, ה-guard ב-_on_zero_result מונע resume כפול.
+                    if kind == "device_zero":
+                        self._on_zero_result(payload)
+                    # אירועי דיאגנוסטיקה/כיול/תצורת משקל — רלוונטיים רק אם מסך ההגדרות פתוח
                     if self.settings_window is not None and self.settings_window.winfo_exists():
                         self.settings_window.handle_engine_event(kind, payload)
-                    # אירועי תצורת משקל — רלוונטיים רק אם המסך הזה פתוח
-                    if (self.scale_config_window is not None
-                            and self.scale_config_window.winfo_exists()):
-                        self.scale_config_window.handle_engine_event(kind, payload)
                     if kind in ("calib_disconnect", "device_reset_disconnect"):
                         self.disconnect()
         except queue.Empty:
@@ -440,6 +517,7 @@ class MainWindow:
 
         product_name = product["name"] if product else NO_PRODUCT_LABEL
         self._add_recent_row(row_id, wall_end, product_name, decided, verdict, count, elapsed)
+        self._refresh_product_summary()
 
         if self.history_window is not None and self.history_window.winfo_exists():
             self.history_window.refresh()
@@ -451,9 +529,38 @@ class MainWindow:
                                         fmt_weight(decided, force_sign=True),
                                         VERDICT_TEXT[verdict], count, f"{elapsed:.2f}s"))
 
-    def _load_recent_from_db(self):
-        """ מציג את כל השקילות שנשמרו (לא רק מה שקרה בהרצה הנוכחית). """
-        for r in db.list_weighings():
+    def _recent_since_bound(self):
+        """ תחילת הטווח הנוכחי (today/week/session), משולב עם "נקה תצוגה" אם נעשה שימוש בה. """
+        now = datetime.now()
+        if self._recent_filter == "today":
+            bound = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        elif self._recent_filter == "week":
+            bound = now - timedelta(days=7)
+        else:  # "session"
+            bound = self._app_start_time
+
+        if self._recent_cleared_at is not None and self._recent_cleared_at > bound:
+            bound = self._recent_cleared_at
+        return bound
+
+    def _on_recent_filter_changed(self, _event=None):
+        display = self.recent_filter_var.get()
+        self._recent_filter = self._recent_display_to_key.get(display, self._recent_filter)
+        # בחירת מסנן מפורשת מבטלת "נקה תצוגה" קודם — אחרת שינוי לטווח רחב יותר
+        # (למשל "שבוע") לא היה מציג שוב שקילות ישנות שהוסתרו ע"י ניקוי.
+        self._recent_cleared_at = None
+        self._refresh_recent_list()
+
+    def _on_clear_recent_display(self):
+        """ מנקה את תצוגת "שקילות אחרונות" בלבד — השקילות עצמן נשארות ב-DB ונגישות
+        דרך "הצג את כל ההיסטוריה". שקילות חדשות ימשיכו להופיע כרגיל. """
+        self._recent_cleared_at = datetime.now()
+        self._refresh_recent_list()
+
+    def _refresh_recent_list(self):
+        self.recent_tree.delete(*self.recent_tree.get_children())
+        since = self._recent_since_bound().isoformat(timespec="seconds")
+        for r in db.list_weighings(since=since):
             time_str = r["timestamp"][11:19] if r["timestamp"] and len(r["timestamp"]) >= 19 \
                 else (r["timestamp"] or "")
             product_name = r["product_name"] or NO_PRODUCT_LABEL
@@ -463,6 +570,24 @@ class MainWindow:
                                             fmt_weight(r["decided_weight"], force_sign=True),
                                             VERDICT_TEXT.get(r["verdict"], r["verdict"]),
                                             r["reading_count"] or 0, elapsed_str))
+        self._refresh_product_summary()
+
+    def _refresh_product_summary(self):
+        """ טבלת סיכום מוצרים (תקין/מעל/מתחת/סה"כ) על אותה קבוצת שקילות המוצגת
+        כרגע ב"שקילות אחרונות" — אותו since (מסנן זמן + "נקה תצוגה"). """
+        self.product_summary_tree.delete(*self.product_summary_tree.get_children())
+        since = self._recent_since_bound().isoformat(timespec="seconds")
+        counts = {}
+        for r in db.list_weighings(since=since):
+            name = r["product_name"] or NO_PRODUCT_LABEL
+            c = counts.setdefault(name, {"green": 0, "red": 0, "yellow": 0, "total": 0})
+            c["total"] += 1
+            if r["verdict"] in c:
+                c[r["verdict"]] += 1
+        for i, name in enumerate(sorted(counts), start=1):
+            c = counts[name]
+            self.product_summary_tree.insert("", "end", values=(
+                i, name, c["green"], c["red"], c["yellow"], c["total"]))
 
     def _on_recent_double_click(self, _event=None):
         sel = self.recent_tree.selection()

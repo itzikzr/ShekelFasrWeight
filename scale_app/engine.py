@@ -28,10 +28,17 @@ except ImportError:
 
 
 def list_serial_ports():
-    """(device, description) לכל פורט זמין. עובד גם ב-Windows (COMx) וגם בלינוקס (/dev/ttyUSBx)."""
+    """
+    (device, description) לכל פורט עם התקן אמיתי מזוהה מאחוריו. עובד גם ב-Windows
+    (COMx) וגם בלינוקס (/dev/ttyUSBx). פורטים בלי תיאור אמיתי (pyserial מחזיר
+    "n/a" — למשל /dev/ttyS0..31 בלינוקס, כניסות סיריאליות ישנות שקיימות תמיד
+    בליבה גם בלי שום חומרה מחוברת) מסוננים החוצה — הם לא שימושיים לחיבור בפועל
+    ורק מציפים את הרשימה.
+    """
     if not SERIAL_AVAILABLE:
         return []
-    ports = [(p.device, p.description) for p in _list_ports.comports()]
+    ports = [(p.device, p.description) for p in _list_ports.comports()
+             if p.description and p.description != "n/a"]
     ports.sort(key=lambda x: (re.sub(r"\d+", "", x[0]),
                               int(m.group()) if (m := re.search(r"\d+", x[0])) else 0))
     return ports
@@ -167,6 +174,14 @@ class WeighingEngine:
 
     def _write(self, data: bytes):
         self.conn.write(data)
+        # בלי flush מפורש, כתיבה ל-port ממתמשת בתור ה-OS בלי הבטחת שידור בפועל
+        # לפני שהקוד ממשיך — נצפה כתקלה ספציפית ל-Linux/FTDI (לא ב-Windows):
+        # פקודות תצורה חד-תווית (F/B/R/I/V/A) לא קיבלו שום תגובה בכלל, לא רק
+        # תגובה "מלוכלכת". flush() חוסם עד שה-OS מדווח שהנתונים באמת נשלחו.
+        try:
+            self.conn.flush()
+        except Exception:
+            pass
 
     def _emit(self, kind, payload=None):
         self.ui_queue.put((kind, payload))
@@ -245,6 +260,12 @@ class WeighingEngine:
         if self._stream_started:
             try:
                 self._write(b"s")
+                # השהיה קטנה כדי לתת למשקל לצאת בפועל ממצב שידור רציף לפני
+                # שפקודות תצורה נשלחות — ואז ניקוי מה שהגיע בזמן המעבר (סוף
+                # חבילת משקל אחרונה וכו') כדי שהתגובה הראשונה שנקרא לא תהיה
+                # מלוכלכת משאריות השידור.
+                time.sleep(0.2)
+                self._flush_input()
             except Exception:
                 pass
             self._stream_started = False
@@ -581,8 +602,9 @@ class WeighingEngine:
     # ──────────────────────────────────────────────
     #
     # כל הפקודות פה הן חילופי בקשה/תשובה קצרים על אותו פורט שהמוניטור הרציף
-    # משתמש בו — הקורא (scale_config_window.py) חייב לעצור את המוניטור
-    # (stop_monitor) לפני פתיחת המסך, בדיוק כמו שאשף הכיול עושה.
+    # משתמש בו — הקורא (SettingsWindow, טאב "תצורת משקל"/"איפוס יצרן") חייב
+    # לעצור את המוניטור (pause_device_access) לפני שליחת פקודות, בדיוק כמו
+    # שאשף הכיול עושה.
     # _device_busy מונע שתי פקודות-מכשיר במקביל על אותו פורט.
 
     def _device_cmd(self, kind, fn):

@@ -6,7 +6,7 @@ import csv
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from . import db, theme
+from . import db, rtl, theme
 from .formatting import fmt_weight
 
 VERDICT_LABELS = {"green": "ירוק — בטווח", "red": "אדום — מעל", "yellow": "צהוב — מתחת",
@@ -23,23 +23,31 @@ class HistoryWindow(tk.Toplevel):
         self.configure(background=theme.BG)
 
         self._current_rows = []
+        # Combobox values are rendered by Tk itself (bidi-reordering the
+        # displayed text on Linux), but filtering compares the selection
+        # against original DB/label strings — these maps translate a
+        # (possibly reordered) displayed value back to the logical one.
+        # No-op dicts on Windows, where rtl.visual() is the identity.
+        self._product_display_to_name = {}
 
         filters = ttk.Frame(self)
         filters.pack(fill="x", padx=10, pady=(10, 6))
 
         ttk.Label(filters, text="מוצר:").pack(side="right", padx=(0, 4))
-        self.product_filter_var = tk.StringVar(value=ALL_LABEL)
+        self.product_filter_var = tk.StringVar(value=rtl.visual(ALL_LABEL))
         self.product_filter_combo = ttk.Combobox(filters, textvariable=self.product_filter_var,
                                                   state="readonly", width=20)
         self.product_filter_combo.pack(side="right", padx=(0, 16))
         self.product_filter_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh())
 
         ttk.Label(filters, text="תוצאה:").pack(side="right", padx=(0, 4))
-        self.verdict_filter_var = tk.StringVar(value=ALL_LABEL)
         verdict_values = [ALL_LABEL] + list(VERDICT_LABELS.values())
+        display_verdict_values = [rtl.visual(v) for v in verdict_values]
+        self._verdict_display_to_label = dict(zip(display_verdict_values, verdict_values))
+        self.verdict_filter_var = tk.StringVar(value=rtl.visual(ALL_LABEL))
         self.verdict_filter_combo = ttk.Combobox(filters, textvariable=self.verdict_filter_var,
                                                   state="readonly", width=18,
-                                                  values=verdict_values)
+                                                  values=display_verdict_values)
         self.verdict_filter_combo.pack(side="right", padx=(0, 16))
         self.verdict_filter_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh())
 
@@ -76,16 +84,21 @@ class HistoryWindow(tk.Toplevel):
 
     def _refresh_product_filter(self):
         names = [ALL_LABEL] + [p["name"] for p in db.list_products()]
-        current = self.product_filter_var.get()
-        self.product_filter_combo.config(values=names)
-        if current not in names:
-            self.product_filter_var.set(ALL_LABEL)
+        current_display = self.product_filter_var.get()
+        current_name = self._product_display_to_name.get(current_display, current_display)
+
+        display_names = [rtl.visual(n) for n in names]
+        self._product_display_to_name = dict(zip(display_names, names))
+        self.product_filter_combo.config(values=display_names)
+        if current_name not in names:
+            self.product_filter_var.set(rtl.visual(ALL_LABEL))
 
     def refresh(self):
         self._refresh_product_filter()
 
         product_id = None
-        product_name = self.product_filter_var.get()
+        product_display = self.product_filter_var.get()
+        product_name = self._product_display_to_name.get(product_display, product_display)
         if product_name != ALL_LABEL:
             for p in db.list_products():
                 if p["name"] == product_name:
@@ -93,7 +106,8 @@ class HistoryWindow(tk.Toplevel):
                     break
 
         verdict = None
-        verdict_label = self.verdict_filter_var.get()
+        verdict_display = self.verdict_filter_var.get()
+        verdict_label = self._verdict_display_to_label.get(verdict_display, verdict_display)
         if verdict_label != ALL_LABEL:
             for key, label in VERDICT_LABELS.items():
                 if label == verdict_label:
