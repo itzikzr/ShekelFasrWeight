@@ -149,7 +149,7 @@ def insert_weighing(decided_weight, reading_count, elapsed_seconds, min_weight, 
     return verdict, cur.lastrowid
 
 
-def list_weighings(product_id=None, verdict=None, limit=None, since=None):
+def list_weighings(product_id=None, verdict=None, limit=None, since=None, until=None):
     query = "SELECT * FROM weighings"
     clauses, params = [], []
     if product_id is not None:
@@ -159,10 +159,14 @@ def list_weighings(product_id=None, verdict=None, limit=None, since=None):
         clauses.append("verdict = ?")
         params.append(verdict)
     if since is not None:
-        # timestamp is stored via datetime.isoformat(timespec="seconds"); since
-        # must be formatted the same way for the string comparison to sort correctly.
+        # timestamp is stored via datetime.isoformat(timespec="seconds"); since/
+        # until must be formatted the same way for the string comparison to sort
+        # correctly (lexicographic order matches chronological order for that format).
         clauses.append("timestamp >= ?")
         params.append(since)
+    if until is not None:
+        clauses.append("timestamp <= ?")
+        params.append(until)
     if clauses:
         query += " WHERE " + " AND ".join(clauses)
     query += " ORDER BY id DESC"

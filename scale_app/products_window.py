@@ -101,7 +101,7 @@ class ProductFormDialog(tk.Toplevel):
         super().__init__(parent)
         self.on_save = on_save
         self.title("מוצר חדש" if product is None else "ערוך מוצר")
-        self.resizable(False, False)
+        theme.maximize_window(self)
         self.grab_set()
         self.focus_set()
         self.configure(background=theme.BG)
@@ -117,27 +117,32 @@ class ProductFormDialog(tk.Toplevel):
         prefilled_display_name = rtl.visual(self._original_name)
         self._prefilled_display_name = prefilled_display_name
 
-        pad = {"padx": 8, "pady": 8}
-        ttk.Label(self, text="שם מוצר:").grid(row=0, column=0, sticky="e", **pad)
-        self.name_var = tk.StringVar(value=prefilled_display_name)
-        ttk.Entry(self, textvariable=self.name_var, width=26).grid(row=0, column=1, **pad)
+        # החלון עצמו ממוקסם (כמו כל שאר החלונות באפליקציה) אבל התוכן קצר —
+        # ממורכז ב-container אחד באמצע המסך, לא נגרר בפינה של שטח ריק.
+        container = ttk.Frame(self)
+        container.place(relx=0.5, rely=0.4, anchor="center")
 
-        ttk.Label(self, text="משקל מטרה (kg):").grid(row=1, column=0, sticky="e", **pad)
+        pad = {"padx": 8, "pady": 8}
+        ttk.Label(container, text="שם מוצר:").grid(row=0, column=0, sticky="e", **pad)
+        self.name_var = tk.StringVar(value=prefilled_display_name)
+        ttk.Entry(container, textvariable=self.name_var, width=26).grid(row=0, column=1, **pad)
+
+        ttk.Label(container, text="משקל מטרה (kg):").grid(row=1, column=0, sticky="e", **pad)
         self.target_var = tk.DoubleVar(value=product["target_weight"] if product else 1.0)
-        ttk.Spinbox(self, textvariable=self.target_var, from_=0.0, to=99999.0,
+        ttk.Spinbox(container, textvariable=self.target_var, from_=0.0, to=99999.0,
                     increment=0.01, width=12, format="%.3f").grid(row=1, column=1, sticky="w", **pad)
 
-        ttk.Label(self, text="טולרנס עליון (kg):").grid(row=2, column=0, sticky="e", **pad)
+        ttk.Label(container, text="טולרנס עליון (kg):").grid(row=2, column=0, sticky="e", **pad)
         self.tol_up_var = tk.DoubleVar(value=product["tolerance_upper"] if product else 0.05)
-        ttk.Spinbox(self, textvariable=self.tol_up_var, from_=0.0, to=9999.0,
+        ttk.Spinbox(container, textvariable=self.tol_up_var, from_=0.0, to=9999.0,
                     increment=0.01, width=12, format="%.3f").grid(row=2, column=1, sticky="w", **pad)
 
-        ttk.Label(self, text="טולרנס תחתון (kg):").grid(row=3, column=0, sticky="e", **pad)
+        ttk.Label(container, text="טולרנס תחתון (kg):").grid(row=3, column=0, sticky="e", **pad)
         self.tol_low_var = tk.DoubleVar(value=product["tolerance_lower"] if product else 0.05)
-        ttk.Spinbox(self, textvariable=self.tol_low_var, from_=0.0, to=9999.0,
+        ttk.Spinbox(container, textvariable=self.tol_low_var, from_=0.0, to=9999.0,
                     increment=0.01, width=12, format="%.3f").grid(row=3, column=1, sticky="w", **pad)
 
-        btns = ttk.Frame(self)
+        btns = ttk.Frame(container)
         btns.grid(row=4, column=0, columnspan=2, pady=(6, 10))
         ttk.Button(btns, text="שמור", style="Accent.TButton",
                    command=self._on_save).pack(side="left", padx=6)

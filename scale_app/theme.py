@@ -12,6 +12,7 @@ Tk הנטיבי משתנה מאוד בין Windows ל-Linux (עיצוב, גופ�
 המסכים שמשתמשים בהם חושפים refresh_theme() שקוראים לו לאחר set_mode().
 """
 
+import sys
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
@@ -210,22 +211,46 @@ def maximize(root):
 
 def maximize_window(win):
     """
-    מתחיל Toplevel (הגדרות/מוצרים/היסטוריה/פירוט שקילה) ממוקסם — עם שורת כותרת
-    ותפריט מזעור/שחזור/סגירה רגילים, לא fullscreen גולמי בלי שורת כותרת כמו
-    maximize() לחלון הראשי. 'zoomed' עובד ב-Windows; fallback ל-'-zoomed'
-    (Linux/X11) ואז לגיאומטריה מלאה מהמסך אם אף אחת מהן לא נתמכת בבילד הזה.
+    מתחיל Toplevel (הגדרות/מוצרים/היסטוריה/דוחות/פירוט שקילה/דיאלוגים) ממוקסם
+    — עם שורת כותרת ותפריט מזעור/שחזור/סגירה רגילים, לא fullscreen גולמי בלי
+    שורת כותרת כמו maximize() לחלון הראשי. 'zoomed' עובד ב-Windows ומדלג ישר
+    להחזרה.
+
+    בלינוקס state("zoomed")/attributes("-zoomed") לא מעלות TclError אבל גם
+    לא ממקסמות בפועל אם הן נשלחות *לפני* שהחלון קיבל מסגרת אמיתית מה-window
+    manager (לפני שהוא "map"-ה על המסך) — נצפה בפועל על Ubuntu/GNOME, וזה
+    קורה תמיד כאן כי maximize_window() נקרא מתוך __init__ החלון, לפני שהוא
+    נראה על המסך בכלל. הפתרון: מתזמנים ניסיון חוזר קצר (win.after) שרץ אחרי
+    שהחלון כבר ממופה, במקום להסתפק בניסיון היחיד המוקדם.
+
+    לא קובעים גיאומטריה מלאה-מסך (WxH+0+0) כ"תיקון בטוח" בלינוקס — גרסה
+    קודמת עשתה את זה וזו בדיוק הסיבה ששורת הכותרת (ועליה כפתור ה-X) נעלמה:
+    ה-window manager מצייר את שורת הכותרת *מעל* ה-y המבוקש, כך שכששורת
+    הכותרת מצטרפת לחלון שכבר מבוקש בגובה המסך המלא ב-y=0, היא בפועל יוצאת
+    ל-y שלילי — מחוץ לתחום הנראה. התוכן ממלא את המסך, אבל אין דרך לסגור את
+    החלון. עדיף חלון שלא התמקסם במלואו ב-WM לא-שכיח על פני חלון בלי X בכלל.
     """
-    try:
-        win.state("zoomed")
+    def _try_zoom():
+        try:
+            win.state("zoomed")
+            return True
+        except tk.TclError:
+            pass
+        try:
+            win.attributes("-zoomed", True)
+            return True
+        except tk.TclError:
+            pass
+        return False
+
+    ok = _try_zoom()
+    if sys.platform == "linux":
+        win.after(150, _try_zoom)
         return
-    except tk.TclError:
-        pass
-    try:
-        win.attributes("-zoomed", True)
+    if ok:
         return
-    except tk.TclError:
-        pass
     try:
+        win.update_idletasks()
         w = win.winfo_screenwidth()
         h = win.winfo_screenheight()
         win.geometry(f"{w}x{h}+0+0")

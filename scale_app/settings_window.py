@@ -7,9 +7,10 @@ main.engine; חלון זה רק קורא/כותב Tk vars ומעדכן את main
 
 import time
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, filedialog, messagebox
 
 from . import autostart, theme
+from . import backup as backup_mod
 from . import engine as engine_mod
 from .engine import decide_weight
 from .formatting import fmt_weight
@@ -47,6 +48,7 @@ class SettingsWindow(tk.Toplevel):
         self.tab_device_info = ttk.Frame(nb, padding=14)
         self.tab_scale_config = ttk.Frame(nb, padding=14)
         self.tab_factory_reset = ttk.Frame(nb, padding=14)
+        self.tab_backup = ttk.Frame(nb, padding=14)
         nb.add(self.tab_conn, text="חיבור")
         nb.add(self.tab_relay, text="ממסרים")
         nb.add(self.tab_weigh, text="שקילה")
@@ -54,6 +56,7 @@ class SettingsWindow(tk.Toplevel):
         nb.add(self.tab_device_info, text="פרטי מכשיר")
         nb.add(self.tab_scale_config, text="הגדרות משקל")
         nb.add(self.tab_factory_reset, text="איפוס יצרן")
+        nb.add(self.tab_backup, text="גיבוי")
 
         self._build_connection_tab()
         self._build_relay_tab()
@@ -62,6 +65,7 @@ class SettingsWindow(tk.Toplevel):
         self._build_device_info_tab()
         self._build_scale_config_tab()
         self._build_factory_reset_tab()
+        self._build_backup_tab()
         self._sync_connection_state()
 
         nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
@@ -289,6 +293,63 @@ class SettingsWindow(tk.Toplevel):
         except (tk.TclError, ValueError):
             return
         self.main.save_settings()
+
+    # ──────────────────────────────────────────────
+    # גיבוי אוטומטי — ראו backup.py (המנגנון) ו-main_window.py (התזמון היומי)
+    # ──────────────────────────────────────────────
+
+    def _build_backup_tab(self):
+        t = self.tab_backup
+        pad = {"padx": 6, "pady": 6}
+
+        self.backup_enabled_var = tk.BooleanVar(value=self.main.backup_enabled)
+        ttk.Checkbutton(t, text="גיבוי אוטומטי יומי", variable=self.backup_enabled_var,
+                        command=self._on_backup_enabled_toggle).grid(
+            row=0, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Label(t, text="גיבוי אחד ליום (לפי תאריך) — נבדק בעלייה ותוך כדי ריצה, "
+                          f"נשמרים {backup_mod.BACKUP_RETENTION_COUNT} הגיבויים האחרונים בלבד.",
+                  style="Muted.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", **pad)
+
+        ttk.Label(t, text="תיקיית גיבוי:").grid(row=2, column=0, sticky="e", **pad)
+        self.backup_dir_var = tk.StringVar(value=self.main.backup_dir)
+        ttk.Entry(t, textvariable=self.backup_dir_var, width=45,
+                 state="readonly").grid(row=2, column=1, sticky="w", **pad)
+        ttk.Button(t, text="בחר תיקייה...", command=self._on_choose_backup_dir).grid(
+            row=2, column=2, **pad)
+
+        self.backup_status_var = tk.StringVar()
+        ttk.Label(t, textvariable=self.backup_status_var,
+                  style="Muted.TLabel").grid(row=3, column=0, columnspan=3, sticky="w", **pad)
+
+        ttk.Button(t, text="גבה עכשיו", style="Accent.TButton",
+                  command=self._on_backup_now).grid(row=4, column=0, sticky="w", **pad)
+
+        self._refresh_backup_status()
+
+    def _refresh_backup_status(self):
+        parts = []
+        parts.append(f"גיבוי אחרון: {self.main.backup_last_date}" if self.main.backup_last_date
+                     else "עוד לא בוצע גיבוי")
+        if self.main.backup_last_error:
+            parts.append(f"שגיאה אחרונה: {self.main.backup_last_error}")
+        self.backup_status_var.set("   |   ".join(parts))
+
+    def _on_backup_enabled_toggle(self):
+        self.main.backup_enabled = self.backup_enabled_var.get()
+        self.main.save_settings()
+
+    def _on_choose_backup_dir(self):
+        chosen = filedialog.askdirectory(initialdir=self.main.backup_dir or ".")
+        if not chosen:
+            return
+        self.main.backup_dir = chosen
+        self.backup_dir_var.set(chosen)
+        self.main.save_settings()
+
+    def _on_backup_now(self):
+        ok, message = self.main.run_backup_now()
+        self._refresh_backup_status()
+        (messagebox.showinfo if ok else messagebox.showerror)("גיבוי", message)
 
     # ──────────────────────────────────────────────
     # שקילה
@@ -807,13 +868,18 @@ class CalibrationDialog(tk.Toplevel):
         self.settings_window = settings_window
         self.engine = settings_window.main.engine
         self.title("כיול Swan — PC0035")
-        self.resizable(False, False)
+        theme.maximize_window(self)
         self.grab_set()
         self.focus_set()
         self.minsize(440, 420)
         self.configure(background=theme.BG)
 
-        frm_top = ttk.LabelFrame(self, text="הגדרות כיול")
+        # החלון ממוקסם כמו כל שאר החלונות, אבל התוכן קצר — ממורכז ב-container
+        # אחד באמצע המסך, לא נגרר בפינה של שטח ריק.
+        container = ttk.Frame(self)
+        container.place(relx=0.5, rely=0.4, anchor="center")
+
+        frm_top = ttk.LabelFrame(container, text="הגדרות כיול")
         frm_top.pack(fill="x", padx=12, pady=(12, 6))
         ttk.Label(frm_top, text="משקל כיול:").grid(row=0, column=0, padx=8, pady=6, sticky="e")
         self.calib_weight_var = tk.IntVar(value=3000)
@@ -822,7 +888,7 @@ class CalibrationDialog(tk.Toplevel):
         self.spn_w.grid(row=0, column=1, padx=4, pady=6, sticky="w")
         ttk.Label(frm_top, text="גרמים").grid(row=0, column=2, sticky="w")
 
-        frm_st = ttk.LabelFrame(self, text="מצב")
+        frm_st = ttk.LabelFrame(container, text="מצב")
         frm_st.pack(fill="x", padx=12, pady=6)
         self.step_var = tk.StringVar(value="הכנס משקל כיול ולחץ 'התחל כיול'")
         self.step_label = ttk.Label(frm_st, textvariable=self.step_var, font=("Arial", 11, "bold"),
@@ -836,21 +902,25 @@ class CalibrationDialog(tk.Toplevel):
         self.pb = ttk.Progressbar(frm_st, orient="horizontal", length=400, maximum=14)
         self.pb.pack(padx=10, pady=(0, 10))
 
-        frm_resp = ttk.LabelFrame(self, text="תגובת המאזניים")
+        frm_resp = ttk.LabelFrame(container, text="תגובת המאזניים")
         frm_resp.pack(fill="x", padx=12, pady=6)
         self.resp_box = scrolledtext.ScrolledText(frm_resp, height=4, state="disabled",
                                                     font=("Consolas", 8))
         self.resp_box.pack(padx=6, pady=6, fill="x")
         self._apply_resp_colors()
 
-        frm_b = ttk.Frame(self)
+        frm_b = ttk.Frame(container)
         frm_b.pack(padx=12, pady=(4, 12))
         self.btn_act = ttk.Button(frm_b, text="התחל כיול", width=14, command=self._on_start)
         self.btn_act.pack(side="left", padx=6)
         self.btn_cls = ttk.Button(frm_b, text="סגור", width=10, command=self._close)
         self.btn_cls.pack(side="left", padx=6)
 
-        self.protocol("WM_DELETE_WINDOW", lambda: None)
+        # X בכותרת החלון מתנהג בדיוק כמו כפתור "סגור" — כולל אותה חסימה בזמן
+        # שלב פעיל בכיול (btn_cls במצב disabled) — לא no-op גורף כמו קודם.
+        # _close() מבטל את הכיול (calib_cancel) ומשחזר גישה למכשיר בכל מקרה,
+        # אז אין סיכון חדש כאן, רק התאמה בין שני הדרכים לסגור את החלון.
+        self.protocol("WM_DELETE_WINDOW", self._on_close_attempt)
 
     def _apply_resp_colors(self):
         self.resp_box.config(background=theme.CARD_BG, foreground=theme.TEXT,
@@ -867,6 +937,13 @@ class CalibrationDialog(tk.Toplevel):
         self.resp_box.insert("end", txt + "\n")
         self.resp_box.see("end")
         self.resp_box.config(state="disabled")
+
+    def _on_close_attempt(self):
+        """ נקרא מ-X בכותרת החלון — מתעלם בזמן שלב פעיל בכיול, בדיוק כמו
+        btn_cls המכובה (disabled) באותם רגעים (ראו _on_start/_on_continue). """
+        if str(self.btn_cls["state"]) == "disabled":
+            return
+        self._close()
 
     def _close(self):
         self.engine.calib_cancel()

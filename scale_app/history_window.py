@@ -8,6 +8,7 @@ from tkinter import ttk, filedialog, messagebox
 
 from . import db, rtl, theme
 from .formatting import fmt_weight
+from .widgets import DatePicker
 
 VERDICT_LABELS = {"green": "ירוק — בטווח", "red": "אדום — מעל", "yellow": "צהוב — מתחת",
                   "none": "ללא מוצר"}
@@ -52,6 +53,17 @@ class HistoryWindow(tk.Toplevel):
         self.verdict_filter_combo.pack(side="right", padx=(0, 16))
         self.verdict_filter_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh())
 
+        ttk.Label(filters, text="מתאריך:").pack(side="right", padx=(0, 4))
+        self.date_from_picker = DatePicker(filters, on_change=self.refresh)
+        self.date_from_picker.pack(side="right", padx=(0, 16))
+
+        ttk.Label(filters, text="עד תאריך:").pack(side="right", padx=(0, 4))
+        self.date_to_picker = DatePicker(filters, on_change=self.refresh)
+        self.date_to_picker.pack(side="right", padx=(0, 16))
+
+        ttk.Button(filters, text="נקה תאריכים",
+                  command=self._clear_date_filter).pack(side="right", padx=(0, 16))
+
         ttk.Button(filters, text="ייצוא ל-CSV", command=self._export_csv).pack(side="left")
 
         body = ttk.Frame(self)
@@ -94,6 +106,24 @@ class HistoryWindow(tk.Toplevel):
         if current_name not in names:
             self.product_filter_var.set(rtl.visual(ALL_LABEL))
 
+    def _clear_date_filter(self):
+        self.date_from_picker.clear()
+        self.date_to_picker.clear()
+        self.refresh()
+
+    def _date_range_bound(self):
+        """
+        (since, until) בפורמט timestamp המחרוזתי של ה-DB, מ-DatePicker.get()
+        (תמיד "" או "YYYY-MM-DD" תקין — נבחר מלוח שנה, לא מוקלד, אז אין צורך
+        באימות פורמט). since מחצות יום ה"מתאריך", until מהשנייה האחרונה של
+        יום ה"עד" (כולל את כל היום, לא רק חצות שלו). None לשניהם אם ריק.
+        """
+        from_text = self.date_from_picker.get()
+        to_text = self.date_to_picker.get()
+        since = f"{from_text}T00:00:00" if from_text else None
+        until = f"{to_text}T23:59:59" if to_text else None
+        return since, until
+
     def refresh(self):
         self._refresh_product_filter()
 
@@ -115,7 +145,8 @@ class HistoryWindow(tk.Toplevel):
                     verdict = key
                     break
 
-        rows = db.list_weighings(product_id=product_id, verdict=verdict)
+        since, until = self._date_range_bound()
+        rows = db.list_weighings(product_id=product_id, verdict=verdict, since=since, until=until)
         self._current_rows = rows
 
         self.tree.delete(*self.tree.get_children())

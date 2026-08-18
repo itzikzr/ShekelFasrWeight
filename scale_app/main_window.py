@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from tkinter import ttk, messagebox
 from pathlib import Path
 
+from . import backup as backup_mod
 from . import db, rtl, theme
 from .engine import WeighingEngine, decide_weight
 from .relay_engine import RelayEngine
@@ -23,9 +24,15 @@ from .settings_window import SettingsWindow
 from .products_window import ProductsWindow
 from .history_window import HistoryWindow
 from .weighing_detail_window import WeighingDetailWindow
+from .reports_window import ReportsWindow
 from .version import __version__
 
 CONFIG_FILE = Path(__file__).resolve().parent.parent / "scale_sampler_config.json"
+DEFAULT_BACKUP_DIR = Path(__file__).resolve().parent.parent / "backups"
+
+# בדיקת "יש גיבוי לבצע?" מרוצת גם תוך כדי ריצה (לא רק בעלייה) — קיוסק יכול
+# לרוץ ברצף כמה ימים בלי להיסגר, ואז רק בדיקה חוזרת תופסת את חצות היום החדש.
+BACKUP_CHECK_INTERVAL_MS = 60 * 60 * 1000
 
 NO_PRODUCT_LABEL = "— ללא מוצר —"
 
@@ -82,6 +89,7 @@ class MainWindow:
         self.settings_window = None
         self.products_window = None
         self.history_window = None
+        self.reports_window = None
 
         self._build_ui()
         self._load_settings()
@@ -89,6 +97,7 @@ class MainWindow:
         self.refresh_products()
         self._refresh_recent_list()
         self._pump_queue()
+        self._backup_tick()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -141,6 +150,7 @@ class MainWindow:
         btns.pack(side="left", padx=4)
         ttk.Button(btns, text="↺ איפוס", command=self._on_zero_click).pack(side="left", padx=3)
         ttk.Button(btns, text="📦 מוצרים", command=self.open_products).pack(side="left", padx=3)
+        ttk.Button(btns, text="📊 דוחות", command=self.open_reports).pack(side="left", padx=3)
         ttk.Button(btns, text="⚙ הגדרות", command=self.open_settings).pack(side="left", padx=3)
         # לא נארז (pack) כאן בכוונה — מוצג רק כש"השתמש בממסרים" מסומן,
         # ראו _sync_relay_ui() (נקרא אחרי _load_settings ובכל שינוי הגדרה).
@@ -299,7 +309,8 @@ class MainWindow:
         for verdict, (fg, bg) in theme.VERDICT_COLORS.items():
             self.recent_tree.tag_configure(verdict, background=bg, foreground=fg)
 
-        for win in (self.settings_window, self.products_window, self.history_window):
+        for win in (self.settings_window, self.products_window, self.history_window,
+                   self.reports_window):
             if win is not None and win.winfo_exists():
                 win.refresh_theme()
 
@@ -335,6 +346,10 @@ class MainWindow:
         # חיישנים מלא, כמו קודם.
         self.relay_use_inputs = bool(cfg.get("relay_use_inputs", True))
         self.relay_engine.settings.sort_pulse_seconds = cfg.get("relay_sort_pulse_seconds", 2.0)
+        self.backup_enabled = bool(cfg.get("backup_enabled", False))
+        self.backup_dir = cfg.get("backup_dir") or str(DEFAULT_BACKUP_DIR)
+        self.backup_last_date = cfg.get("backup_last_date")   # "YYYY-MM-DD" או None
+        self.backup_last_error = None   # לא מתמיד — רק לתצוגה בטאב "גיבוי" בזמן ריצה
 
     def save_settings(self):
         cfg = {
@@ -354,11 +369,51 @@ class MainWindow:
             "relay_baud": self.relay_baud,
             "relay_use_inputs": self.relay_use_inputs,
             "relay_sort_pulse_seconds": self.relay_engine.settings.sort_pulse_seconds,
+            "backup_enabled": self.backup_enabled,
+            "backup_dir": self.backup_dir,
+            "backup_last_date": self.backup_last_date,
         }
         try:
             CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception:
             pass
+
+    # ──────────────────────────────────────────────
+    # Backup אוטומטי יומי — ראו backup.py למנגנון עצמו (sqlite backup API + גיזום)
+    # ──────────────────────────────────────────────
+
+    def _backup_tick(self):
+        """ נקרא בעלייה ואז מחדש כל BACKUP_CHECK_INTERVAL_MS — ראו הערה ליד
+        הקבוע: קיוסק יכול לרוץ ברצף כמה ימים בלי להיסגר, אז רק בדיקה חוזרת
+        תוך כדי ריצה (לא רק __init__) תופסת את חצות היום החדש. """
+        self._maybe_run_backup()
+        self.root.after(BACKUP_CHECK_INTERVAL_MS, self._backup_tick)
+
+    def _maybe_run_backup(self):
+        """ מריץ גיבוי לכל היותר פעם ביום קלנדרי (לפי backup_last_date השמור),
+        רק אם backup_enabled. """
+        if not self.backup_enabled:
+            return
+        if self.backup_last_date == datetime.now().date().isoformat():
+            return
+        self.run_backup_now()
+
+    def run_backup_now(self):
+        """ מריץ גיבוי מיידית (גם מכפתור "גבה עכשיו" בהגדרות, גם מ-_maybe_run_backup)
+        ומעדכן backup_last_date/backup_last_error — כך שגיבוי ידני היום מונע גם
+        את הריצה האוטומטית הכפולה של אותו יום. מחזיר (ok: bool, message: str).
+        כשל לא מציג הודעה בעצמו ולא מעדכן backup_last_date (כדי שהבדיקה הבאה
+        תנסה שוב במקום לדלג יום שלם) — רק שומר ל-backup_last_error לתצוגה
+        בטאב "גיבוי" בהגדרות; ההודעה המוחזרת מוצגת ע"י הקורא (הכפתור הידני). """
+        try:
+            dest_path = backup_mod.run_backup(Path(self.backup_dir))
+        except Exception as e:
+            self.backup_last_error = str(e)
+            return False, f"גיבוי נכשל:\n{e}"
+        self.backup_last_error = None
+        self.backup_last_date = datetime.now().date().isoformat()
+        self.save_settings()
+        return True, f"נשמר אל:\n{dest_path}"
 
     # ──────────────────────────────────────────────
     # Connection (מהכפתור במסך הראשי או ממסך ההגדרות)
@@ -536,6 +591,14 @@ class MainWindow:
         else:
             self.history_window.lift()
             self.history_window.focus_set()
+
+    def open_reports(self):
+        if self.reports_window is None or not self.reports_window.winfo_exists():
+            self.reports_window = ReportsWindow(self)
+        else:
+            self.reports_window.refresh()
+            self.reports_window.lift()
+            self.reports_window.focus_set()
 
     def _settings_device_tab_active(self):
         """ True אם הגדרות פתוחות וכרגע על טאב "תצורת משקל"/"איפוס יצרן" — שכבר
