@@ -9,6 +9,7 @@
 
 import json
 import queue
+import threading
 import tkinter as tk
 from datetime import datetime, timedelta
 from tkinter import ttk, messagebox
@@ -16,6 +17,7 @@ from pathlib import Path
 
 from . import backup as backup_mod
 from . import db, rtl, theme
+from . import lan_dashboard, update_check
 from .engine import WeighingEngine, decide_weight
 from .relay_engine import RelayEngine
 from .formatting import fmt_weight
@@ -33,6 +35,10 @@ DEFAULT_BACKUP_DIR = Path(__file__).resolve().parent.parent / "backups"
 # בדיקת "יש גיבוי לבצע?" מרוצת גם תוך כדי ריצה (לא רק בעלייה) — קיוסק יכול
 # לרוץ ברצף כמה ימים בלי להיסגר, ואז רק בדיקה חוזרת תופסת את חצות היום החדש.
 BACKUP_CHECK_INTERVAL_MS = 60 * 60 * 1000
+
+# בדיוק אותו טעם כמו BACKUP_CHECK_INTERVAL_MS — קיוסק שרץ ברצף כמה ימים.
+UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000
+DEFAULT_LAN_DASHBOARD_PORT = 8090
 
 NO_PRODUCT_LABEL = "— ללא מוצר —"
 
@@ -71,11 +77,15 @@ class MainWindow:
         self.ui_queue: "queue.Queue" = queue.Queue()
         self.engine = WeighingEngine(self.ui_queue)
         self.relay_engine = RelayEngine(self.ui_queue)
-        # כניסה1/כניסה2 בכרטיס הממסרים קובעות התחלה/סיום שקילה — ראו
-        # _sync_relay_sensor_mode() (נקרא מכל שינוי במצב "השתמש בממסרים"
-        # ומכל connect/disconnect של הממסרים) ו-engine.EngineSettings.use_relay_sensors.
-        self.relay_engine.on_input1_edge = self.engine.force_start_session
-        self.relay_engine.on_input2_edge = self.engine.force_stop_session
+        # כניסה1/כניסה2 בכרטיס הממסרים יכולות לקבוע התחלה/סיום שקילה, לפי
+        # start_trigger/stop_trigger שנבחרו בהגדרות — ראו _sync_relay_sensor_mode()
+        # (נקרא מכל שינוי בהגדרות הממסרים ומכל connect/disconnect שלהם) ו-
+        # engine.EngineSettings.start_trigger/stop_trigger. RelayEngine מדווח
+        # את כל ארבעת המעברים הגולמיים; WeighingEngine מסנן לפי ההגדרה הנוכחית.
+        self.relay_engine.on_input1_close = self.engine.on_sensor1_close
+        self.relay_engine.on_input1_open = self.engine.on_sensor1_open
+        self.relay_engine.on_input2_close = self.engine.on_sensor2_close
+        self.relay_engine.on_input2_open = self.engine.on_sensor2_open
         self._relay_motor_on = False
 
         self.current_product_id = None
@@ -91,13 +101,30 @@ class MainWindow:
         self.history_window = None
         self.reports_window = None
 
+        # דשבורד רשת מקומית — ראו lan_dashboard.py. הסנאפשוט מתעדכן בהצבה
+        # שלמה של dict חדש (לא מוטציה במקום) כך שקריאה מתהליכון ה-HTTP
+        # (אחר) בטוחה בלי lock, בדיוק כמו EngineSettings/דגלי הממסרים — שמור
+        # רק ל"חיבור"/"משקל חי" (מצב זיכרון, לא ב-DB בכלל). היסטוריה/דוחות/
+        # שקילות אחרונות בדשבורד נקראים ישירות מה-DB (חיבור sqlite נפרד,
+        # readonly, ראו lan_dashboard._connect_readonly) — לא מהסנאפשוט הזה.
+        self._dashboard_snapshot = {"connected": False, "live_weight": "---", "generated_at": ""}
+        self.lan_dashboard = lan_dashboard.LanDashboardServer(
+            lambda: self._dashboard_snapshot, lambda: db.DB_FILE)
+
+        # בדיקת עדכון גרסה מרוחקת — ראו update_check.py. לא מבוצע pull
+        # אוטומטית לעולם, רק בדיקה + הצגת תזכורת (ראו _sync_update_indicator).
+        self._update_status = {"ok": None}
+
         self._build_ui()
         self._load_settings()
         self._sync_relay_ui()
+        if self.lan_dashboard_enabled:
+            self.start_lan_dashboard()
         self.refresh_products()
         self._refresh_recent_list()
         self._pump_queue()
         self._backup_tick()
+        self._update_check_tick()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -125,26 +152,34 @@ class MainWindow:
 
         self._logo_image = tk.PhotoImage(file=str(theme.ASSETS_DIR / "logo.png"))
         self.logo_label = tk.Label(brand_frame, image=self._logo_image, background=theme.CARD_BG)
-        self.logo_label.pack(side="right", padx=(8, 0))
+        self.logo_label.pack(side="right")
 
-        brand_text = ttk.Frame(brand_frame, style="Card.TFrame")
-        brand_text.pack(side="right")
-        self.version_label = tk.Label(brand_text, text=f"גרסה {__version__}",
+        # סטטוס חיבור + גרסה זה מתחת לזה (לא ליד הלוגו) — מפנה מקום ברוחב
+        # הכותרת, בין השאר כדי ש"▶ התחל" (כשממסרים מסומנים) יהיה לו מקום.
+        status_frame = ttk.Frame(header, style="Card.TFrame")
+        status_frame.pack(side="right", padx=(0, 16))
+
+        self.status_pill = StatusPill(status_frame)
+        self.status_pill.pack(anchor="e")
+        self.status_pill.set("מנותק", theme.IDLE_GRAY)
+
+        self.version_label = tk.Label(status_frame, text=f"גרסה {__version__}",
                                       font=(f["sans"], 8), background=theme.CARD_BG,
                                       foreground=theme.TEXT_MUTED)
         self.version_label.pack(anchor="e")
 
-        self.status_pill = StatusPill(header)
-        self.status_pill.pack(side="right", padx=(0, 16))
-        self.status_pill.set("מנותק", theme.IDLE_GRAY)
+        # לא נארז (pack) כאן בכוונה — מוצג רק כשמתגלה עדכון, ראו _sync_update_indicator.
+        self.update_indicator = tk.Label(status_frame, text="🔔 עדכון זמין", cursor="hand2",
+                                         font=(f["sans"], 8, "bold"), background=theme.CARD_BG,
+                                         foreground=theme.ACCENT)
+        self.update_indicator.bind("<Button-1>", lambda e: self.open_settings())
 
         self.btn_connect_toggle = ttk.Button(header, text="התחבר", style="Accent.TButton",
                                              command=self._on_connect_click)
         self.btn_connect_toggle.pack(side="right", padx=(0, 16))
 
-        self.btn_theme_toggle = ttk.Button(header, text=self._theme_toggle_label(),
-                                           command=self._toggle_theme, width=11)
-        self.btn_theme_toggle.pack(side="left", padx=3)
+        # מצב כהה/בהיר עבר להגדרות (טאב "חיבור") — ראו SettingsWindow, כדי
+        # לפנות מקום בכותרת. _toggle_theme() נשאר כאן, רק לא כפתור בכותרת.
 
         btns = ttk.Frame(header, style="Card.TFrame")
         btns.pack(side="left", padx=4)
@@ -181,21 +216,21 @@ class MainWindow:
         # כלפי מעלה. לא expand=True יותר — מרותק לראש הפאנל כדי שטבלת סיכום
         # המוצרים למטה (ראו summary_frame) תקבל את שאר השטח הפנוי.
         right_inner = ttk.Frame(right_panel, style="Card.TFrame")
-        right_inner.pack(pady=(24, 8))
+        right_inner.pack(pady=(12, 8))
 
+        # אין יותר כיתוב "משקל נוכחי" מעל המשקל — הוסר כדי שהמשקל יתפוס את
+        # החלק העליון של הפאנל (ראו גם ה-pady המוקטן של right_inner לעיל).
         self.weight_var = tk.StringVar(value="---")
-        self.weight_caption_label = tk.Label(right_inner, text="משקל נוכחי", font=(f["sans"], 11),
-                                             background=theme.CARD_BG, foreground=theme.TEXT_MUTED)
-        self.weight_caption_label.pack(pady=(0, 2))
         self.weight_label = tk.Label(right_inner, textvariable=self.weight_var,
                                      font=(f["mono"], 56, "bold"),
                                      background=theme.CARD_BG, foreground=theme.ACCENT)
         self.weight_label.pack()
 
-        # מלבן צבעוני רחב (בערך ברוחב תצוגת המשקל) שמחליף את הרמזור התלת-נורתי —
-        # רק הצבע משתנה, בלי הטקסט/ההערות שהיו מתחתיו קודם. status_line_var
-        # נשאר קיים ומתעדכן (משמש מקומות אחרים בעתיד/דיבוג) אבל לא מוצג יותר.
-        self.traffic = ColorBar(right_inner, width=RIGHT_PANEL_WIDTH - 80, height=40)
+        # מלבן צבעוני רחב (בערך ברוחב תצוגת המשקל, מוגדל קצת מהגרסה הקודמת)
+        # שמחליף את הרמזור התלת-נורתי — הצבע *וגם* תוצאת השקילה (VERDICT_TEXT)
+        # מוצגים בתוכו. status_line_var נשאר קיים ומתעדכן (משמש מקומות אחרים
+        # בעתיד/דיבוג) אבל לא מוצג יותר.
+        self.traffic = ColorBar(right_inner, width=RIGHT_PANEL_WIDTH - 40, height=50)
         self.traffic.pack(pady=18)
 
         self.status_line_var = tk.StringVar(value="מנותק — פתח הגדרות להתחברות")
@@ -281,10 +316,8 @@ class MainWindow:
     # Theme (בהיר/כהה)
     # ──────────────────────────────────────────────
 
-    def _theme_toggle_label(self):
-        return "☀ מצב בהיר" if self.dark_mode else "🌙 מצב כהה"
-
     def _toggle_theme(self):
+        """ נקרא מתיבת הסימון "מצב כהה" בהגדרות (טאב "חיבור"), לא מכפתור בכותרת. """
         self.dark_mode = not self.dark_mode
         self.fonts = theme.set_mode(self.root, "dark" if self.dark_mode else "light")
         self.save_settings()
@@ -292,13 +325,11 @@ class MainWindow:
 
     def _refresh_theme_widgets(self):
         """ מעדכן ווידג'טי tk גולמיים שלא מתעדכנים אוטומטית ע"י ה-ttk style. """
-        self.btn_theme_toggle.config(text=self._theme_toggle_label())
-
-        for label in (self.logo_label, self.version_label,
-                      self.weight_caption_label, self.weight_label):
+        for label in (self.logo_label, self.version_label, self.update_indicator,
+                      self.weight_label):
             label.configure(background=theme.CARD_BG)
         self.version_label.configure(foreground=theme.TEXT_MUTED)
-        self.weight_caption_label.configure(foreground=theme.TEXT_MUTED)
+        self.update_indicator.configure(foreground=theme.ACCENT)
         self.weight_label.configure(foreground=theme.ACCENT)
 
         self.status_pill.refresh_theme()
@@ -341,15 +372,26 @@ class MainWindow:
         self.relay_enabled = bool(cfg.get("relay_enabled", False))
         self.relay_port = cfg.get("relay_port", "")
         self.relay_baud = cfg.get("relay_baud") or "19200"
-        # ברירת מחדל True כדי לא לשנות התנהגות למי שכבר הגדיר relay_enabled
-        # לפני שהצ'קבוקס הזה נוסף — "השתמש בממסרים" בלבד המשיך לתת מצב
-        # חיישנים מלא, כמו קודם.
-        self.relay_use_inputs = bool(cfg.get("relay_use_inputs", True))
+        # migration מה-checkbox הבינארי הישן (relay_use_inputs) לשני צירים
+        # עצמאיים (start_trigger/stop_trigger) — אם המפתח הישן קיים וערכו
+        # False, זה "לא ממסרים לצורך התחלה/סיום, רק סף משקל עם armed-gate"
+        # (require_armed הישן); בכל מקרה אחר (כולל קונפיג שנשמר לפני שהצ'קבוקס
+        # הזה נוסף בכלל) — מצב החיישנים המלא שהיה קיים מאז ומתמיד, כמו קודם.
+        old_use_inputs = cfg.get("relay_use_inputs")  # None אם לא הוגדר אף פעם
+        default_start, default_stop = ("sensor1_open", "sensor2_close")
+        if old_use_inputs is False:
+            default_start, default_stop = ("threshold", "threshold")
+        self.start_trigger = cfg.get("start_trigger", default_start)
+        self.stop_trigger = cfg.get("stop_trigger", default_stop)
         self.relay_engine.settings.sort_pulse_seconds = cfg.get("relay_sort_pulse_seconds", 2.0)
         self.backup_enabled = bool(cfg.get("backup_enabled", False))
         self.backup_dir = cfg.get("backup_dir") or str(DEFAULT_BACKUP_DIR)
         self.backup_last_date = cfg.get("backup_last_date")   # "YYYY-MM-DD" או None
         self.backup_last_error = None   # לא מתמיד — רק לתצוגה בטאב "גיבוי" בזמן ריצה
+        self.lan_dashboard_enabled = bool(cfg.get("lan_dashboard_enabled", False))
+        self.lan_dashboard_port = int(cfg.get("lan_dashboard_port") or DEFAULT_LAN_DASHBOARD_PORT)
+        self.update_check_enabled = bool(cfg.get("update_check_enabled", False))
+        self.update_last_check_date = cfg.get("update_last_check_date")   # "YYYY-MM-DD" או None
 
     def save_settings(self):
         cfg = {
@@ -367,11 +409,16 @@ class MainWindow:
             "relay_enabled": self.relay_enabled,
             "relay_port": self.relay_port,
             "relay_baud": self.relay_baud,
-            "relay_use_inputs": self.relay_use_inputs,
+            "start_trigger": self.start_trigger,
+            "stop_trigger": self.stop_trigger,
             "relay_sort_pulse_seconds": self.relay_engine.settings.sort_pulse_seconds,
             "backup_enabled": self.backup_enabled,
             "backup_dir": self.backup_dir,
             "backup_last_date": self.backup_last_date,
+            "lan_dashboard_enabled": self.lan_dashboard_enabled,
+            "lan_dashboard_port": self.lan_dashboard_port,
+            "update_check_enabled": self.update_check_enabled,
+            "update_last_check_date": self.update_last_check_date,
         }
         try:
             CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -416,6 +463,89 @@ class MainWindow:
         return True, f"נשמר אל:\n{dest_path}"
 
     # ──────────────────────────────────────────────
+    # דשבורד רשת מקומית — ראו lan_dashboard.py
+    # ──────────────────────────────────────────────
+
+    def start_lan_dashboard(self):
+        self.lan_dashboard.start(self.lan_dashboard_port)
+
+    def stop_lan_dashboard(self):
+        self.lan_dashboard.stop()
+
+    def _update_dashboard_snapshot(self, **overrides):
+        """
+        מחליף את self._dashboard_snapshot ב-dict *חדש* לגמרי (לא מוטציה של
+        הקיים) — כך שתהליכון ה-HTTP (lan_dashboard.py, קורא בלי lock) לעולם
+        לא רואה מצב חצי-מעודכן: הוא תמיד קורא או את כל ה-dict הישן, או את כל
+        החדש, בלי מצב אמצעי אפשרי בפייתון עם GIL.
+        """
+        snap = dict(self._dashboard_snapshot)
+        snap.update(overrides)
+        snap["generated_at"] = datetime.now().strftime("%H:%M:%S")
+        self._dashboard_snapshot = snap
+
+    # ──────────────────────────────────────────────
+    # בדיקת עדכון גרסה מרוחקת — ראו update_check.py למנגנון (git fetch/pull)
+    # ──────────────────────────────────────────────
+
+    def _update_check_tick(self):
+        self._maybe_check_for_update()
+        self.root.after(UPDATE_CHECK_INTERVAL_MS, self._update_check_tick)
+
+    def _maybe_check_for_update(self):
+        if not self.update_check_enabled:
+            return
+        if self.update_last_check_date == datetime.now().date().isoformat():
+            return
+        self.check_for_update_now()
+
+    def check_for_update_now(self):
+        """ רץ בתהליכון נפרד — git fetch הוא רשת, ותקיעה כאן הייתה מקפיאה
+        את כל ה-UI (בדיוק כמו שכל I/O טורי/רשת באפליקציה הזו רץ מחוץ
+        לתהליכון הראשי). התוצאה חוזרת דרך ui_queue, כרגיל. """
+        threading.Thread(target=self._check_for_update_worker, daemon=True).start()
+
+    def _check_for_update_worker(self):
+        result = update_check.check_for_update()
+        self.ui_queue.put(("update_check_result", result))
+
+    def _on_update_check_result(self, result):
+        self._update_status = result
+        if result.get("ok"):
+            # מסמנים "נבדק היום" רק בהצלחה — כשל (למשל אין אינטרנט) מנסה
+            # שוב בבדיקה הבאה במקום לדלג יום שלם, בדיוק כמו _maybe_run_backup.
+            self.update_last_check_date = datetime.now().date().isoformat()
+            self.save_settings()
+        self._sync_update_indicator()
+        if self.settings_window is not None and self.settings_window.winfo_exists():
+            self.settings_window.refresh_update_status()
+
+    def _sync_update_indicator(self):
+        show = bool(self._update_status.get("ok") and self._update_status.get("update_available"))
+        if show:
+            if not self.update_indicator.winfo_ismapped():
+                self.update_indicator.pack(anchor="e")
+        else:
+            if self.update_indicator.winfo_ismapped():
+                self.update_indicator.pack_forget()
+
+    def apply_update_now(self):
+        """ נקרא רק מלחיצה מפורשת על "עדכן" בהגדרות — לעולם לא אוטומטית.
+        רץ בתהליכון נפרד (git pull הוא גם רשת), תוצאה חוזרת דרך ui_queue. """
+        threading.Thread(target=self._apply_update_worker, daemon=True).start()
+
+    def _apply_update_worker(self):
+        result = update_check.apply_update()
+        self.ui_queue.put(("update_apply_result", result))
+
+    def _on_update_apply_result(self, result):
+        if self.settings_window is not None and self.settings_window.winfo_exists():
+            self.settings_window.handle_update_apply_result(result)
+        if result.get("ok"):
+            # git pull הצליח — מרעננים את הבדיקה כדי שהתזכורת בכותרת תיעלם.
+            self.check_for_update_now()
+
+    # ──────────────────────────────────────────────
     # Connection (מהכפתור במסך הראשי או ממסך ההגדרות)
     # ──────────────────────────────────────────────
 
@@ -442,6 +572,7 @@ class MainWindow:
         self.status_pill.set("מחובר", theme.GREEN)
         self.status_line_var.set("מחכה למשקל...")
         self._sync_connect_button()
+        self._update_dashboard_snapshot(connected=True)
         self.engine.start_monitor()
 
     def disconnect(self):
@@ -451,6 +582,7 @@ class MainWindow:
         self.weight_var.set("---")
         self.traffic.set_state("none")
         self._sync_connect_button()
+        self._update_dashboard_snapshot(connected=False, live_weight="---")
 
     # ──────────────────────────────────────────────
     # Relays (כרטיס IA-3116-U2i — מנוע המסוע + חיישני התחלה/סיום שקילה +
@@ -473,16 +605,18 @@ class MainWindow:
     def _sync_relay_sensor_mode(self):
         """
         active = "השתמש בממסרים" מסומן *וגם* הממסרים בפועל מחוברים — "עובד
-        אז מחליף, לא עובד אז כמו קודם" כפי שהתבקש. בתוך active, "השתמש
-        בכניסות (INPUT)" (relay_use_inputs) בוחר בין שני תת-מצבים:
-          - מסומן: use_relay_sensors — כניסה1/כניסה2 קובעות התחלה/סיום.
-          - לא מסומן: require_armed — סף המשקל הרגיל, אבל התחלת שקילה
-            חדשה דורשת גם armed=True ("התחל" = מפתח הפעלה). ראו
-            engine._monitor_loop. נקרא מכל שינוי בכל אחד מהתנאים האלה.
+        אז מחליף, לא עובד אז כמו קודם" כפי שהתבקש. כש-active, ה-start_trigger/
+        stop_trigger שנבחרו בהגדרות (טאב "ממסרים") מועברים כמו שהם ל-engine
+        (שלוש אפשרויות עצמאיות לכל אחד: "threshold"/"sensor1_close"/
+        "sensor1_open" להתחלה, "threshold"/"sensor2_close"/"sensor2_open"
+        לסיום — ראו engine.EngineSettings ו-engine._monitor_loop). כש-not
+        active, שניהם נכפים חזרה ל-"threshold" בלי קשר לבחירה השמורה, בדיוק
+        כמו לפני שהתכונה הזו נוספה. נקרא מכל שינוי בכל אחד מהתנאים האלה.
         """
         active = self.relay_enabled and self.relay_engine.connected
-        self.engine.settings.use_relay_sensors = active and self.relay_use_inputs
-        self.engine.settings.require_armed = active and not self.relay_use_inputs
+        self.engine.settings.relay_active = active
+        self.engine.settings.start_trigger = self.start_trigger if active else "threshold"
+        self.engine.settings.stop_trigger = self.stop_trigger if active else "threshold"
         self.engine.settings.armed = self._relay_motor_on
 
     def _sync_relay_ui(self):
@@ -634,6 +768,10 @@ class MainWindow:
             self.relay_engine.disconnect()
         except Exception:
             pass
+        try:
+            self.lan_dashboard.stop()
+        except Exception:
+            pass
         self.root.destroy()
 
     # ──────────────────────────────────────────────
@@ -648,7 +786,13 @@ class MainWindow:
                     # מציגים בדיוק כמו שההתקן שלח (payload[1] = מספר הספרות
                     # אחרי הנקודה בפריים הגולמי) — לא כופים פורמט קבוע (3 ספרות).
                     w, decimals = payload
-                    self.weight_var.set(fmt_weight(w, decimals=decimals if decimals is not None else 3))
+                    weight_str = fmt_weight(w, decimals=decimals if decimals is not None else 3)
+                    self.weight_var.set(weight_str)
+                    self._update_dashboard_snapshot(live_weight=weight_str)
+                elif kind == "update_check_result":
+                    self._on_update_check_result(payload)
+                elif kind == "update_apply_result":
+                    self._on_update_apply_result(payload)
                 elif kind == "session_start":
                     self.status_line_var.set("שוקל...")
                 elif kind == "session_done":
@@ -696,7 +840,8 @@ class MainWindow:
                                              basis, product)
         db.insert_weighing_readings(row_id, readings, window_start, window_end)
 
-        self.traffic.set_state(verdict)
+        self.traffic.set_state(verdict, f"{fmt_weight(decided, force_sign=True)} kg   "
+                                        f"{VERDICT_TEXT.get(verdict, '')}")
         self.status_line_var.set(
             f"הושלם: {fmt_weight(decided)} kg   {VERDICT_TEXT[verdict]}   "
             f"({count} קריאות, {elapsed:.1f}s)")

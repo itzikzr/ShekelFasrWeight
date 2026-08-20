@@ -7,11 +7,14 @@
 תפקיד הכרטיס באפליקציה (מוגדר ע"י המשתמש):
   ממסר 1   — מנוע המסוע. הפעלה/כיבוי ידניים (כפתור "התחל"/"עצור" בעמוד
              הראשי, MainWindow._on_relay_motor_toggle).
-  כניסה 1  — מעבר סגור→פתוח = הקופסה כולה כבר על משטח השקילה. טריגר
-             להתחלת שקילה (WeighingEngine.force_start_session, במקום סף
-             המשקל, כשמצב "עבודה עם ממסרים" פעיל — ראו engine.py).
-  כניסה 2  — מעבר פתוח→סגור = הקופסה מתחילה לצאת. טריגר לסיום השקילה
-             (WeighingEngine.force_stop_session) ולתחילת מיון.
+  כניסה 1/2 — מדווחים כאן את שני המעברים (close/open) של כל כניסה, בלי
+             לפרש אותם — WeighingEngine.on_sensor1_close/on_sensor1_open/
+             on_sensor2_close/on_sensor2_open (engine.py) הם שקובעים איזה
+             מעבר בפועל מתחיל/מסיים שקילה, לפי start_trigger/stop_trigger
+             שנבחרו בהגדרות (למשל: כניסה1 סגור→פתוח = "הקופסה כולה על
+             המשקל", כניסה2 פתוח→סגור = "הקופסה מתחילה לצאת" — הבחירה
+             ההיסטורית היחידה — אבל אלה רק שתיים מתוך שש אפשרויות נתמכות).
+             סיום שקילה מפעיל גם מיון (ממסר 2-4, ראו למטה).
   ממסר 2/3/4 — מיון לפי verdict (צהוב/ירוק/אדום), פועל activate_sort_relay()
              למשך RelaySettings.sort_pulse_seconds, או עד שמיון חדש מגיע
              (המוקדם מביניהם) — ראו _poll_loop.
@@ -50,10 +53,11 @@ class RelaySettings:
 
 class RelayEngine:
     """
-    מנהל את החיבור הטורי לכרטיס הממסרים. on_input1_edge/on_input2_edge הם
-    callbacks אופציונליים (נקבעים ע"י MainWindow) שנקראים ישירות מ-_poll_loop
-    כשמתגלה המעבר המתאים — לא עוברים דרך ui_queue, כי אלה רק קריאות פונקציה
-    פשוטות (force_start_session/force_stop_session ב-WeighingEngine, שמגדירות
+    מנהל את החיבור הטורי לכרטיס הממסרים. on_input1_close/on_input1_open/
+    on_input2_close/on_input2_open הם callbacks אופציונליים (נקבעים ע"י
+    MainWindow) שנקראים ישירות מ-_poll_loop כשמתגלה המעבר המתאים — לא עוברים
+    דרך ui_queue, כי אלה רק קריאות פונקציה פשוטות (on_sensor1_close/
+    on_sensor1_open/on_sensor2_close/on_sensor2_open ב-WeighingEngine, שמגדירות
     דגל בוליאני — בטוח חוצה-thread כמו EngineSettings, ראו engine.py), ואין
     צורך בעיכוב הסבב-הלוך-חזור דרך התהליכון הראשי לאירוע קריטי-לזמן כזה.
     """
@@ -63,8 +67,14 @@ class RelayEngine:
         self.settings = RelaySettings()
         self.conn = None
 
-        self.on_input1_edge = None
-        self.on_input2_edge = None
+        # ארבעה callbacks, אחד לכל מעבר (close/open) של כל כניסה — לא רק
+        # מעבר אחד לכל כניסה כמו קודם. WeighingEngine (לא הכרטיס עצמו) מחליט
+        # איזה מעבר בפועל רלוונטי, לפי start_trigger/stop_trigger שנבחרו
+        # בהגדרות — ראו engine.py.
+        self.on_input1_close = None
+        self.on_input1_open = None
+        self.on_input2_close = None
+        self.on_input2_open = None
 
         self._poll_thread = None
         self._running = False
@@ -193,8 +203,8 @@ class RelayEngine:
             self._emit("relay_error", str(e))
             # לא רק מסמנים _running=False — סוגרים גם את conn ומאפסים אותו,
             # אחרת self.connected (conn is not None) עדיין יחזיר True אחרי
-            # שה-thread שקורא כניסות/שולח פקודות כבר מת, ו-use_relay_sensors
-            # יישאר "פעיל" בלי שאף דבר יזין force_start/force_stop לעולם —
+            # שה-thread שקורא כניסות/שולח פקודות כבר מת, וההתחלה/סיום המבוססים
+            # על חיישן יישארו "פעילים" בלי שאף דבר יזין את הדגלים לעולם —
             # השקילה תיתקע במצב WEIGHING לנצח. ראו MainWindow._pump_queue.
             self._running = False
             if self.conn:
@@ -209,7 +219,12 @@ class RelayEngine:
 
     def _process_status(self, status_hex):
         """ status_hex = 8 תווי הקס (ABCDEFGH מהתגובה ל-?aa2). D (אינדקס 3)
-        מכיל את ביטים 0-3 של כניסות 1-4; bit0=כניסה1, bit1=כניסה2. """
+        מכיל את ביטים 0-3 של כניסות 1-4; bit0=כניסה1, bit1=כניסה2.
+
+        מדווחים את שני המעברים (close/open) של כל כניסה בנפרד, לא רק את
+        המעבר ה"הגיוני" שהיה בשימוש עד כה — מי שבוחר איזה מעבר בפועל
+        מתחיל/מסיים שקילה הוא WeighingEngine (start_trigger/stop_trigger),
+        לא הכרטיס. """
         try:
             input_nibble = int(status_hex[3], 16)
         except (ValueError, IndexError):
@@ -217,10 +232,14 @@ class RelayEngine:
         input1 = bool(input_nibble & 0x1)
         input2 = bool(input_nibble & 0x2)
 
-        if self._prev_input1 is True and input1 is False and self.on_input1_edge:
-            self.on_input1_edge()
-        if self._prev_input2 is False and input2 is True and self.on_input2_edge:
-            self.on_input2_edge()
+        if self._prev_input1 is False and input1 is True and self.on_input1_close:
+            self.on_input1_close()
+        if self._prev_input1 is True and input1 is False and self.on_input1_open:
+            self.on_input1_open()
+        if self._prev_input2 is False and input2 is True and self.on_input2_close:
+            self.on_input2_close()
+        if self._prev_input2 is True and input2 is False and self.on_input2_open:
+            self.on_input2_open()
 
         self._prev_input1 = input1
         self._prev_input2 = input2

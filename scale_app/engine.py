@@ -103,20 +103,25 @@ class EngineSettings:
         self.debounce_s = 0.4       # שניות מתחת לסף לפני סיום שקילה
         self.show_each = True       # האם לשדר ל-log כל קריאה בודדת (דיאגנוסטיקה)
         self.min_save_weight = 0.0  # kg — משקל שהוחלט מתחתיו לא נשמר ל-DB
-        # True = כניסה1/כניסה2 בכרטיס הממסרים קובעות התחלה/סיום שקילה (ראו
-        # force_start_session/force_stop_session), במקום סף המשקל. MainWindow
-        # מדליק את זה רק כשגם "השתמש בממסרים" מסומן, גם כרטיס הממסרים באמת
-        # מחובר וגם "השתמש בכניסות (INPUT)" מסומן — "עובד אז מחליף, לא עובד
-        # אז כמו קודם" (בקשת המשתמש).
-        self.use_relay_sensors = False
-        # True = ממסרים מחוברים ופעילים אבל "השתמש בכניסות (INPUT)" *לא*
-        # מסומן — משתמשים בסף המשקל הרגיל, אבל התחלת שקילה חדשה דורשת גם
-        # armed=True ("כפתור התחל הוא מפתח הפעלה", לא רק סף משקל תמיד-פעיל).
-        # ממסרי המיון (2-4) עדיין פועלים כרגיל בסוף שקילה, בלי קשר לזה.
-        self.require_armed = False
-        # True בזמן שהמנוע (ממסר 1) דלוק — כלומר המפעיל לחץ "התחל". נקרא רק
-        # כש-require_armed פעיל; לא משפיע במצב חיישנים (use_relay_sensors) או
-        # במצב הרגיל (לא ממסרים בכלל).
+        # שני צירים עצמאיים לגמרי, לא דגל בינארי אחד: מה מתחיל שקילה
+        # ("threshold" | "sensor1_close" | "sensor1_open") ומה מסיים אותה
+        # ("threshold" | "sensor2_close" | "sensor2_open") — ראו
+        # on_sensor1_close/on_sensor1_open/on_sensor2_close/on_sensor2_open
+        # למטה ו-MainWindow._sync_relay_sensor_mode. ברירות המחדל כאן הן
+        # "לא ממסרים בכלל" (ערכים אינרטיים בזמן בנייה); הערכים האמיתיים
+        # מגיעים מ-_sync_relay_sensor_mode לאחר טעינת ההגדרות.
+        self.start_trigger = "threshold"
+        self.stop_trigger = "threshold"
+        # True = ממסרים מחוברים ופעילים (בלי קשר לאיזה start_trigger/
+        # stop_trigger נבחר). כש-start_trigger=="threshold" וגם relay_active
+        # פעיל, התחלת שקילה חדשה דורשת גם armed=True ("כפתור התחל הוא מפתח
+        # הפעלה", לא רק סף משקל תמיד-פעיל) — בדיוק כמו require_armed הישן.
+        # כש-relay_active כבוי (אין ממסרים בכלל), armed לא משפיע — סף המשקל
+        # פעיל תמיד, כמו לפני שהתכונה הזו נוספה. ממסרי המיון (2-4) פועלים
+        # כרגיל בסוף שקילה בכל מקרה, בלי קשר לכל זה.
+        self.relay_active = False
+        # True בזמן שהמנוע (ממסר 1) דלוק — כלומר המפעיל לחץ "התחל". רלוונטי
+        # רק כש-start_trigger=="threshold" וגם relay_active פעיל.
         self.armed = False
 
 
@@ -144,15 +149,26 @@ class WeighingEngine:
         self._pending_force_start = False
         self._pending_force_stop = False
 
-    def force_start_session(self):
-        """ נקרא מ-RelayEngine (thread נפרד) כשכניסה1 מסמנת שהקופסה כולה על
-        המשטח. נלקח בחשבון רק כש-settings.use_relay_sensors פעיל. """
-        self._pending_force_start = True
+    # ארבע השיטות הבאות נקראות מ-RelayEngine (thread נפרד) בכל מעבר גולמי
+    # של כניסה 1/2 — הן, לא RelayEngine, קובעות אם המעבר הזה בפועל רלוונטי,
+    # לפי start_trigger/stop_trigger הנוכחיים ב-EngineSettings. כך אפשר
+    # לשנות את הבחירה בהגדרות בזמן ריצה בלי לחבר מחדש callbacks.
 
-    def force_stop_session(self):
-        """ נקרא מ-RelayEngine (thread נפרד) כשכניסה2 מסמנת שהקופסה מתחילה
-        לצאת. נלקח בחשבון רק כש-settings.use_relay_sensors פעיל. """
-        self._pending_force_stop = True
+    def on_sensor1_close(self):
+        if self.settings.start_trigger == "sensor1_close":
+            self._pending_force_start = True
+
+    def on_sensor1_open(self):
+        if self.settings.start_trigger == "sensor1_open":
+            self._pending_force_start = True
+
+    def on_sensor2_close(self):
+        if self.settings.stop_trigger == "sensor2_close":
+            self._pending_force_stop = True
+
+    def on_sensor2_open(self):
+        if self.settings.stop_trigger == "sensor2_open":
+            self._pending_force_stop = True
 
     # ──────────────────────────────────────────────
     # Connection
@@ -352,23 +368,38 @@ class WeighingEngine:
                     threshold  = self.settings.threshold
                     debounce_s = self.settings.debounce_s
 
-                    sensor_mode = self.settings.use_relay_sensors
+                    start_trigger = self.settings.start_trigger
+                    stop_trigger = self.settings.stop_trigger
 
                     if state == "IDLE":
-                        # במצב חיישנים, כניסה1 (RelayEngine.on_input1_edge ->
-                        # force_start_session) מחליפה את בדיקת הסף — לא בודקים
-                        # w בכלל, בדיוק כמו שהתבקש ("עובד אז מחליף").
-                        if sensor_mode:
+                        # start_trigger != "threshold": כניסת חיישן (close/open
+                        # של כניסה1, ראו on_sensor1_close/on_sensor1_open) מחליפה
+                        # את בדיקת הסף — לא בודקים w בכלל, בדיוק כמו שהתבקש
+                        # ("עובד אז מחליף").
+                        if start_trigger != "threshold":
                             start_now = self._pending_force_start
                         else:
-                            # require_armed: ממסרים מחוברים אבל "השתמש
-                            # בכניסות" לא מסומן — סף המשקל הרגיל, אבל רק
-                            # כשהמפעיל לחץ "התחל" (armed=True). לא ממסרים
-                            # בכלל -> require_armed=False -> בדיוק כמו קודם.
-                            gate_ok = (not self.settings.require_armed) or self.settings.armed
+                            # relay_active וגם start_trigger=="threshold": ממסרים
+                            # מחוברים אבל בחירת ההתחלה היא סף משקל — סף המשקל
+                            # הרגיל, אבל רק כשהמפעיל לחץ "התחל" (armed=True).
+                            # לא ממסרים בכלל -> relay_active=False -> בדיוק כמו קודם.
+                            gate_ok = (not self.settings.relay_active) or self.settings.armed
                             start_now = gate_ok and (w > threshold)
                         if start_now:
                             self._pending_force_start = False
+                            # מבטלים גם דגל סיום תקוע — כניסה2 יכולה להידלק
+                            # (רעד/רעש, או קופסה שרק חיישן 2 שלה נגע בלי
+                            # שחיישן 1 נדלק בשבילה) *בזמן ש-IDLE*, לפני שיש
+                            # שקילה פעילה בכלל; on_sensor2_close/on_sensor2_open
+                            # נכתבים מ-thread אחר בלי לדעת שאנחנו ב-IDLE, אז הדגל
+                            # נשאר True בלי שאף אחד קורא אותו. בלי האיפוס הזה,
+                            # ברגע שהשקילה הבאה מתחילה כאן, הענף של WEIGHING
+                            # היה מיד "רואה" את הדגל התקוע ומסיים אותה כמעט
+                            # ברגע שהתחילה — זה מה שנצפה בפועל ("ברגע שמזהים
+                            # כניסה1, זה כותב את משקל הקופסה" מיד, עם נתונים
+                            # כמעט ריקים) כשכניסה2 הגיעה לפני כניסה1 עבור
+                            # הקופסה הנוכחית.
+                            self._pending_force_stop = False
                             state = "WEIGHING"
                             session_start = now
                             session_wall_start = datetime.datetime.now()
@@ -380,6 +411,30 @@ class WeighingEngine:
                                                    f"> סף {threshold:.2f} ──", "summary"))
 
                     elif state == "WEIGHING":
+                        if start_trigger != "threshold" and self._pending_force_start:
+                            # כניסה1 נדלקה בשנית *באמצע* שקילה, בלי שכניסה2
+                            # סימנה סיום קודם — המפעיל הוריד את הקופסה והריץ
+                            # שוב, לא רעש שיש להתעלם ממנו. מתחילים שקילה חדשה
+                            # מאפס (כמו IDLE->WEIGHING הרגיל) במקום להמשיך לצבור
+                            # מ-session_start המקורי — זה מה שגרם ל"זמן מהפעם
+                            # הראשונה" שנצפה בפועל: elapsed חושב תמיד מה-start
+                            # הישן, לעולם לא התאפס כשכניסה1 נדלקה שוב.
+                            self._pending_force_start = False
+                            # וכמו ב-IDLE->WEIGHING: מבטלים גם דגל סיום תקוע
+                            # שנשאר מהשקילה הישנה שמתבטלת כרגע — אחרת השקילה
+                            # החדשה הזו תיגמר באופן מיידי בדיוק מהסיבה שתוקנה
+                            # למעלה.
+                            self._pending_force_stop = False
+                            session_start = now
+                            session_wall_start = datetime.datetime.now()
+                            session_readings = [(0.0, w, status)]
+                            below_since = None
+                            self._emit("session_start", w)
+                            if self.settings.show_each:
+                                self._emit("log", ("── שקילה הופעלה מחדש (כניסה1 נדלקה שוב) ──",
+                                                   "summary"))
+                            continue
+
                         t_sess = now - session_start
                         session_readings.append((t_sess, w, status))
                         if self.settings.show_each:
@@ -389,9 +444,22 @@ class WeighingEngine:
 
                         # ממשיכים לצבור readings בשני המצבים (decide_weight
                         # צריך אותם) — רק תנאי הסיום עצמו משתנה.
-                        if sensor_mode:
+                        if stop_trigger != "threshold":
                             if self._pending_force_stop:
                                 self._pending_force_stop = False
+                                # מבטלים גם דגל התחלה תקוע — כניסה1 יכולה
+                                # להאיר שוב (קופסה נוספת שנדחקת/מתקרבת, רעד
+                                # בחיווט וכו') *בזמן* שהשקילה הנוכחית עדיין
+                                # פעילה; on_sensor1_close/on_sensor1_open
+                                # נכתבים מ-thread אחר בלי לדעת שאנחנו כבר ב-WEIGHING, אז הדגל
+                                # נשאר True בלי שאף אחד קורא אותו. בלי האיפוס
+                                # הזה, הרגע שחוזרים ל-IDLE כאן היה מתחיל שקילה
+                                # חדשה מיידית מהדגל התקוע, לפני שכניסה1 באמת
+                                # נדלקה מחדש בשביל הקופסה הבאה — זה מה שנצפה
+                                # בפועל ("ברגע שמזהים סיום כניסה1, מתחיל תהליך
+                                # חדש") כשכניסה2 (סיום) הגיעה לפני שכניסה1
+                                # התאפסה בפועל עבור הקופסה הנוכחית.
+                                self._pending_force_start = False
                                 elapsed = now - session_start
                                 state = "IDLE"
                                 self._emit("session_done",

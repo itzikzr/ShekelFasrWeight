@@ -1,0 +1,3 @@
+[submodule "M6ConveyorAI"]
+	path = M6ConveyorAI
+	url = https://github.com/itzikzr/M6ConveyorAI.git

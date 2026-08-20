@@ -9,11 +9,23 @@ import time
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog, messagebox
 
-from . import autostart, theme
+from . import autostart, rtl, theme
 from . import backup as backup_mod
 from . import engine as engine_mod
+from . import lan_dashboard
 from .engine import decide_weight
 from .formatting import fmt_weight
+
+START_TRIGGER_LABELS = {
+    "threshold": "סף משקל (כמו היום בלי חיישנים)",
+    "sensor1_close": "חיישן כניסה — בכניסת הקופסה (מוקדם)",
+    "sensor1_open": "חיישן כניסה — כשהקופסה כולה על המשקל",
+}
+STOP_TRIGGER_LABELS = {
+    "threshold": "סף משקל (כמו היום בלי חיישנים)",
+    "sensor2_close": "חיישן יציאה — כשהקופסה מתחילה לצאת",
+    "sensor2_open": "חיישן יציאה — כשהקופסה עזבה לחלוטין",
+}
 
 BAUD_LABELS = ["4800", "9600", "14400", "19200", "28800", "38400", "57600", "115200"]
 ROUND_LABELS = ["1g", "1g", "2g", "5g", "10g", "20g", "50g", "100g"]
@@ -49,6 +61,8 @@ class SettingsWindow(tk.Toplevel):
         self.tab_scale_config = ttk.Frame(nb, padding=14)
         self.tab_factory_reset = ttk.Frame(nb, padding=14)
         self.tab_backup = ttk.Frame(nb, padding=14)
+        self.tab_dashboard = ttk.Frame(nb, padding=14)
+        self.tab_updates = ttk.Frame(nb, padding=14)
         nb.add(self.tab_conn, text="חיבור")
         nb.add(self.tab_relay, text="ממסרים")
         nb.add(self.tab_weigh, text="שקילה")
@@ -57,6 +71,8 @@ class SettingsWindow(tk.Toplevel):
         nb.add(self.tab_scale_config, text="הגדרות משקל")
         nb.add(self.tab_factory_reset, text="איפוס יצרן")
         nb.add(self.tab_backup, text="גיבוי")
+        nb.add(self.tab_dashboard, text="דשבורד רשת")
+        nb.add(self.tab_updates, text="עדכונים")
 
         self._build_connection_tab()
         self._build_relay_tab()
@@ -66,6 +82,8 @@ class SettingsWindow(tk.Toplevel):
         self._build_scale_config_tab()
         self._build_factory_reset_tab()
         self._build_backup_tab()
+        self._build_dashboard_tab()
+        self._build_updates_tab()
         self._sync_connection_state()
 
         nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
@@ -115,6 +133,14 @@ class SettingsWindow(tk.Toplevel):
                             variable=self.autostart_var,
                             command=self._on_autostart_toggle).grid(
                 row=6, column=0, columnspan=3, sticky="w", **pad)
+
+        ttk.Separator(t, orient="horizontal").grid(
+            row=7, column=0, columnspan=3, sticky="ew", pady=(10, 4))
+        # עבר לכאן מכפתור בכותרת המסך הראשי — כדי לפנות מקום ל"▶ התחל".
+        self.dark_mode_var = tk.BooleanVar(value=self.main.dark_mode)
+        ttk.Checkbutton(t, text="מצב כהה", variable=self.dark_mode_var,
+                        command=self._on_dark_mode_toggle).grid(
+            row=8, column=0, columnspan=3, sticky="w", **pad)
 
         self._refresh_ports()
 
@@ -168,6 +194,11 @@ class SettingsWindow(tk.Toplevel):
             messagebox.showerror("שגיאה", str(e))
             self.autostart_var.set(autostart.is_enabled())
 
+    def _on_dark_mode_toggle(self):
+        # main._toggle_theme() הופך את dark_mode הנוכחי — לא קורא את הערך
+        # מה-checkbox עצמו — אז לחיצה מכאן ותוצאתה עקביות בכל מקרה.
+        self.main._toggle_theme()
+
     # ──────────────────────────────────────────────
     # ממסרים (כרטיס IA-3116-U2i) — חיבור סיריאלי נפרד ועצמאי מהמשקל.
     # ──────────────────────────────────────────────
@@ -184,39 +215,61 @@ class SettingsWindow(tk.Toplevel):
                           "(כניסות 1-2) ומיון לפי תוצאה (ממסרים 2-4).",
                   style="Muted.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", **pad)
 
-        self.relay_use_inputs_var = tk.BooleanVar(value=self.main.relay_use_inputs)
-        ttk.Checkbutton(t, text="השתמש בכניסות (INPUT) לכניסה/יציאה",
-                        variable=self.relay_use_inputs_var,
-                        command=self._on_relay_use_inputs_toggle).grid(
-            row=2, column=0, columnspan=3, sticky="w", **pad)
-        ttk.Label(t, text="לא מסומן: התחלת שקילה חוזרת לסף המשקל הרגיל, אבל רק "
-                          "אחרי לחיצה על \"התחל\" (מפתח הפעלה) — ממסרי המיון "
-                          "ממשיכים לפעול כרגיל בסוף כל שקילה.",
-                  style="Muted.TLabel").grid(row=3, column=0, columnspan=3, sticky="w", **pad)
+        self._start_trigger_display_to_key = {
+            rtl.visual(label): key for key, label in START_TRIGGER_LABELS.items()
+        }
+        self._stop_trigger_display_to_key = {
+            rtl.visual(label): key for key, label in STOP_TRIGGER_LABELS.items()
+        }
+
+        ttk.Label(t, text="מתחיל שקילה לפי:").grid(row=2, column=0, sticky="e", **pad)
+        self.start_trigger_var = tk.StringVar(
+            value=rtl.visual(START_TRIGGER_LABELS.get(self.main.start_trigger, "")))
+        self.start_trigger_combo = ttk.Combobox(
+            t, textvariable=self.start_trigger_var, state="readonly", width=38,
+            values=[rtl.visual(v) for v in START_TRIGGER_LABELS.values()])
+        self.start_trigger_combo.grid(row=2, column=1, columnspan=2, sticky="w", **pad)
+        self.start_trigger_combo.bind("<<ComboboxSelected>>", self._on_start_trigger_changed)
+
+        ttk.Label(t, text="מסיים שקילה לפי:").grid(row=3, column=0, sticky="e", **pad)
+        self.stop_trigger_var = tk.StringVar(
+            value=rtl.visual(STOP_TRIGGER_LABELS.get(self.main.stop_trigger, "")))
+        self.stop_trigger_combo = ttk.Combobox(
+            t, textvariable=self.stop_trigger_var, state="readonly", width=38,
+            values=[rtl.visual(v) for v in STOP_TRIGGER_LABELS.values()])
+        self.stop_trigger_combo.grid(row=3, column=1, columnspan=2, sticky="w", **pad)
+        self.stop_trigger_combo.bind("<<ComboboxSelected>>", self._on_stop_trigger_changed)
+
+        ttk.Label(t, text="\"סף משקל\" בהתחלה/סיום פועל כמו לפני שהיו חיישנים כלל — "
+                          "אבל אם נבחר להתחלה, שקילה חדשה מתחילה רק אחרי לחיצה על "
+                          "\"התחל\" (מפתח הפעלה). ממסרי המיון (2-4) ממשיכים לפעול "
+                          "כרגיל בסוף כל שקילה בכל מקרה.",
+                  style="Muted.TLabel", wraplength=420).grid(
+            row=4, column=0, columnspan=3, sticky="w", **pad)
 
         ttk.Separator(t, orient="horizontal").grid(
-            row=4, column=0, columnspan=3, sticky="ew", pady=(6, 6))
+            row=5, column=0, columnspan=3, sticky="ew", pady=(6, 6))
 
-        ttk.Label(t, text="Port:").grid(row=5, column=0, sticky="e", **pad)
+        ttk.Label(t, text="Port:").grid(row=6, column=0, sticky="e", **pad)
         self.relay_port_var = tk.StringVar(value=self.main.relay_port)
         self.relay_port_combo = ttk.Combobox(t, textvariable=self.relay_port_var,
                                              width=30, state="readonly")
-        self.relay_port_combo.grid(row=5, column=1, **pad)
+        self.relay_port_combo.grid(row=6, column=1, **pad)
         ttk.Button(t, text="⟳", width=3, command=self._refresh_relay_ports).grid(
-            row=5, column=2, **pad)
+            row=6, column=2, **pad)
 
-        ttk.Label(t, text="Baud:").grid(row=6, column=0, sticky="e", **pad)
+        ttk.Label(t, text="Baud:").grid(row=7, column=0, sticky="e", **pad)
         self.relay_baud_var = tk.StringVar(value=self.main.relay_baud)
         ttk.Combobox(t, textvariable=self.relay_baud_var, state="readonly", width=10,
                      values=["1200", "2400", "4800", "9600", "19200", "38400",
-                             "57600", "115200"]).grid(row=6, column=1, sticky="w", **pad)
+                             "57600", "115200"]).grid(row=7, column=1, sticky="w", **pad)
 
         self.relay_status_var = tk.StringVar()
         ttk.Label(t, textvariable=self.relay_status_var,
-                  style="Muted.TLabel").grid(row=7, column=0, columnspan=3, sticky="w", **pad)
+                  style="Muted.TLabel").grid(row=8, column=0, columnspan=3, sticky="w", **pad)
 
         relay_btn_frame = ttk.Frame(t)
-        relay_btn_frame.grid(row=8, column=0, columnspan=3, sticky="w", **pad)
+        relay_btn_frame.grid(row=9, column=0, columnspan=3, sticky="w", **pad)
         self.btn_relay_connect = ttk.Button(relay_btn_frame, text="התחבר",
                                             style="Accent.TButton", command=self._on_relay_connect)
         self.btn_relay_connect.pack(side="left", padx=4)
@@ -225,14 +278,14 @@ class SettingsWindow(tk.Toplevel):
         self.btn_relay_disconnect.pack(side="left", padx=4)
 
         ttk.Separator(t, orient="horizontal").grid(
-            row=9, column=0, columnspan=3, sticky="ew", pady=(10, 6))
+            row=10, column=0, columnspan=3, sticky="ew", pady=(10, 6))
 
-        ttk.Label(t, text="זמן הפעלת ממסר מיון (שניות):").grid(row=10, column=0, sticky="e", **pad)
+        ttk.Label(t, text="זמן הפעלת ממסר מיון (שניות):").grid(row=11, column=0, sticky="e", **pad)
         self.relay_pulse_var = tk.DoubleVar(value=self.main.relay_engine.settings.sort_pulse_seconds)
         ttk.Spinbox(t, textvariable=self.relay_pulse_var, from_=0.2, to=30.0,
-                    increment=0.1, width=8, format="%.1f").grid(row=10, column=1, sticky="w", **pad)
+                    increment=0.1, width=8, format="%.1f").grid(row=11, column=1, sticky="w", **pad)
         ttk.Label(t, text="ממסר המיון נכבה קודם זמן זה אם מיון חדש מתחיל",
-                  style="Muted.TLabel").grid(row=11, column=0, columnspan=2, sticky="w", **pad)
+                  style="Muted.TLabel").grid(row=12, column=0, columnspan=2, sticky="w", **pad)
         self.relay_pulse_var.trace_add("write", lambda *a: self._apply_relay_pulse_duration())
 
         self._refresh_relay_ports()
@@ -263,8 +316,19 @@ class SettingsWindow(tk.Toplevel):
         self.main._sync_relay_sensor_mode()
         self.main._sync_relay_ui()
 
-    def _on_relay_use_inputs_toggle(self):
-        self.main.relay_use_inputs = self.relay_use_inputs_var.get()
+    def _on_start_trigger_changed(self, event=None):
+        key = self._start_trigger_display_to_key.get(self.start_trigger_var.get())
+        if key is None:
+            return
+        self.main.start_trigger = key
+        self.main.save_settings()
+        self.main._sync_relay_sensor_mode()
+
+    def _on_stop_trigger_changed(self, event=None):
+        key = self._stop_trigger_display_to_key.get(self.stop_trigger_var.get())
+        if key is None:
+            return
+        self.main.stop_trigger = key
         self.main.save_settings()
         self.main._sync_relay_sensor_mode()
 
@@ -350,6 +414,145 @@ class SettingsWindow(tk.Toplevel):
         ok, message = self.main.run_backup_now()
         self._refresh_backup_status()
         (messagebox.showinfo if ok else messagebox.showerror)("גיבוי", message)
+
+    # ──────────────────────────────────────────────
+    # דשבורד רשת מקומית — ראו lan_dashboard.py
+    # ──────────────────────────────────────────────
+
+    def _build_dashboard_tab(self):
+        t = self.tab_dashboard
+        pad = {"padx": 6, "pady": 6}
+
+        self.dashboard_enabled_var = tk.BooleanVar(value=self.main.lan_dashboard_enabled)
+        ttk.Checkbutton(t, text="הפעל דשבורד רשת מקומית", variable=self.dashboard_enabled_var,
+                        command=self._on_dashboard_enabled_toggle).grid(
+            row=0, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Label(t, text="עמוד קריאה-בלבד (סטטוס חיבור, משקל חי, סיכום היום) — נגיש מכל "
+                          "מכשיר באותה רשת מקומית (טלפון וכו'). אין בו אף פעולת שליטה "
+                          "או הגדרה — רק תצוגה.",
+                  style="Muted.TLabel", wraplength=520,
+                  justify="right").grid(row=1, column=0, columnspan=3, sticky="w", **pad)
+
+        ttk.Label(t, text="פורט:").grid(row=2, column=0, sticky="e", **pad)
+        self.dashboard_port_var = tk.IntVar(value=self.main.lan_dashboard_port)
+        port_spin = ttk.Spinbox(t, textvariable=self.dashboard_port_var, from_=1024, to=65535,
+                                width=8)
+        port_spin.grid(row=2, column=1, sticky="w", **pad)
+        # מגיב רק על עזיבת השדה/Enter, לא על כל הקשה — אחרת כל ספרה שמוקלדת
+        # (למשל "8" -> "80" -> "809" -> "8090") הייתה מפעילה מחדש את השרת.
+        port_spin.bind("<FocusOut>", lambda e: self._on_dashboard_port_changed())
+        port_spin.bind("<Return>", lambda e: self._on_dashboard_port_changed())
+
+        self.dashboard_status_var = tk.StringVar()
+        ttk.Label(t, textvariable=self.dashboard_status_var,
+                  style="Muted.TLabel").grid(row=3, column=0, columnspan=3, sticky="w", **pad)
+
+        self._refresh_dashboard_status()
+
+    def _refresh_dashboard_status(self):
+        if self.main.lan_dashboard.running:
+            url = f"http://{lan_dashboard.local_lan_ip()}:{self.main.lan_dashboard_port}/"
+            self.dashboard_status_var.set(f"פעיל — פתח בטלפון/מחשב אחר: {url}")
+        else:
+            self.dashboard_status_var.set("כבוי")
+
+    def _on_dashboard_enabled_toggle(self):
+        self.main.lan_dashboard_enabled = self.dashboard_enabled_var.get()
+        self.main.save_settings()
+        if self.main.lan_dashboard_enabled:
+            self.main.start_lan_dashboard()
+        else:
+            self.main.stop_lan_dashboard()
+        self._refresh_dashboard_status()
+
+    def _on_dashboard_port_changed(self):
+        try:
+            port = int(self.dashboard_port_var.get())
+        except (tk.TclError, ValueError):
+            return
+        if port == self.main.lan_dashboard_port:
+            return
+        self.main.lan_dashboard_port = port
+        self.main.save_settings()
+        if self.main.lan_dashboard.running:
+            # שינוי פורט תוך כדי ריצה — מפעילים מחדש על הפורט החדש.
+            self.main.stop_lan_dashboard()
+            self.main.start_lan_dashboard()
+        self._refresh_dashboard_status()
+
+    # ──────────────────────────────────────────────
+    # בדיקת עדכון גרסה מרוחקת — ראו update_check.py
+    # ──────────────────────────────────────────────
+
+    def _build_updates_tab(self):
+        t = self.tab_updates
+        pad = {"padx": 6, "pady": 6}
+
+        self.update_enabled_var = tk.BooleanVar(value=self.main.update_check_enabled)
+        ttk.Checkbutton(t, text="בדוק עדכונים אוטומטית", variable=self.update_enabled_var,
+                        command=self._on_update_enabled_toggle).grid(
+            row=0, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Label(t, text="בדיקה אחת ליום (git fetch, לא pull) — נבדק בעלייה ותוך כדי ריצה. "
+                          "אף פעם לא מעדכן בפועל בלי לחיצה מפורשת על \"עדכן\" למטה.",
+                  style="Muted.TLabel", wraplength=520,
+                  justify="right").grid(row=1, column=0, columnspan=2, sticky="w", **pad)
+
+        self.update_status_var = tk.StringVar()
+        ttk.Label(t, textvariable=self.update_status_var, style="Muted.TLabel",
+                 wraplength=520, justify="right").grid(
+            row=2, column=0, columnspan=2, sticky="w", **pad)
+
+        btns = ttk.Frame(t)
+        btns.grid(row=3, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Button(btns, text="בדוק עכשיו", command=self._on_check_update_now).pack(
+            side="left", padx=4)
+        self.btn_apply_update = ttk.Button(btns, text="עדכן (git pull)",
+                                           style="Accent.TButton",
+                                           command=self._on_apply_update)
+        self.btn_apply_update.pack(side="left", padx=4)
+
+        self.refresh_update_status()
+
+    def refresh_update_status(self):
+        """ נקרא ע"י MainWindow אחרי כל תוצאת בדיקה (גם אוטומטית, גם ידנית). """
+        status = self.main._update_status
+        if status.get("ok") is None:
+            self.update_status_var.set("עוד לא נבדק")
+        elif not status.get("ok"):
+            self.update_status_var.set(f"הבדיקה נכשלה: {status.get('error', '')}")
+        elif status.get("update_available"):
+            self.update_status_var.set(
+                f"יש עדכון חדש ({status.get('commits_behind')} commits): "
+                f"{status.get('latest_summary', '')}")
+        else:
+            self.update_status_var.set("התוכנה מעודכנת לגרסה האחרונה")
+        self.btn_apply_update.config(
+            state="normal" if status.get("ok") and status.get("update_available") else "disabled")
+
+    def _on_update_enabled_toggle(self):
+        self.main.update_check_enabled = self.update_enabled_var.get()
+        self.main.save_settings()
+
+    def _on_check_update_now(self):
+        self.update_status_var.set("בודק...")
+        self.main.check_for_update_now()
+
+    def _on_apply_update(self):
+        if not messagebox.askyesno("עדכון", "להוריד ולהתקין את העדכון (git pull)? "
+                                            "יש לסגור ולהפעיל מחדש את התוכנה בסיום."):
+            return
+        self.btn_apply_update.config(state="disabled")
+        self.update_status_var.set("מעדכן...")
+        self.main.apply_update_now()
+
+    def handle_update_apply_result(self, result):
+        """ נקרא ע"י MainWindow._on_update_apply_result. """
+        if result.get("ok"):
+            messagebox.showinfo("עדכון", "העדכון הותקן בהצלחה — סגור והפעל מחדש "
+                                        "את התוכנה כדי שהשינויים יחולו.")
+        else:
+            messagebox.showerror("עדכון", f"העדכון נכשל:\n{result.get('error', '')}")
+        self.refresh_update_status()
 
     # ──────────────────────────────────────────────
     # שקילה

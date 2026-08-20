@@ -1,0 +1,267 @@
+VERSION
+8
+
+COMMSETTINGS
+0
+COM15
+COM2
+9600
+2
+63
+4
+0
+0
+
+COMMDISPLAY
+0
+
+VERSATAP
+0
+
+CHANNELALIAS
+
+
+
+SEND
+0
+Version
+1B 56 1B 65
+0
+1
+
+SEND
+1
+v - weight record 5g
+1B 57 1B 65
+1
+.5
+
+SEND
+2
+------------------------------
+
+0
+1
+
+SEND
+3
+set zero
+1B 5A 1B 65
+0
+1
+
+SEND
+4
+reboot
+1B 62 1B 65
+0
+1
+
+SEND
+5
+----------TEST MODE ---
+
+0
+5
+
+SEND
+6
+brut
+1B 41 1B 45
+1
+.5
+
+SEND
+7
+Calibration
+1B 50 33 30 30 30 1B 65
+0
+.5
+
+SEND
+8
+CALIBRATION Next
+1B 4E 1B 65
+0
+1
+
+SEND
+9
+----------DIAGNOSTIC MODE---
+
+0
+5
+
+SEND
+10
+info
+1B 69 1B 65
+0
+.5
+
+SEND
+11
+-----------PROGRAMMER---
+
+0
+5
+
+SEND
+12
+Set Full
+1B 46 39 39 39 39 39 1B 65
+0
+.5
+
+SEND
+13
+Set Full
+1B 46 35 30 30 30 30 1B 65
+0
+.5
+
+SEND
+14
+Set DEFAULT
+1B 44 45 46 41 55 4C 54 1B 65
+0
+.5
+
+SEND
+15
+Weight
+1B 57 1B 45
+1
+.5
+
+SEND
+16
+W
+57
+1
+.1
+
+SEND
+17
+Decimal Point
+1B 51 1B 65
+0
+.5
+
+SEND
+18
+Decimal Point = 3
+1B 51 33 1B 65
+0
+.5
+
+SEND
+19
+BaudRate
+42
+0
+.5
+
+SEND
+20
+BaudRate = 115200
+42 37
+0
+.5
+
+SEND
+21
+BaudRate = 9600
+42 31
+0
+.5
+
+SEND
+22
+Round
+1B 52 1B 65
+0
+.5
+
+SEND
+23
+Round = 1
+1B 52 31 1B 65
+0
+.5
+
+SEND
+24
+Round = 50
+1B 52 35 30 1B 65
+0
+.5
+
+SEND
+25
+Round = 5 gr
+1B 52 33 1B 65
+0
+.5
+
+SEND
+26
+W
+57
+0
+5
+
+SEND
+27
+---- Factory Reset ---
+1B 44 1B 65
+0
+.5
+
+SEND
+28
+Stream Weight ON
+53
+0
+.5
+
+SEND
+29
+Stream Weight Off
+73
+0
+.5
+
+SEND
+30
+Zero
+5A
+0
+5
+
+SEND
+31
+Get Full
+46
+0
+5
+
+SEND
+32
+Change Full to 6000
+46 37 30 30 30 30 0D
+0
+5
+
+RECEIVE
+0
+
+0A
+7
+0
+COMMENT 
+0
+1
+0
+0
+

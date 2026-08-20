@@ -17,31 +17,44 @@ _HEBREW_MONTHS = ["ינואר", "פברואר", "מרץ", "אפריל", "מאי"
 
 class ColorBar(tk.Canvas):
     """
-    מלבן רחב שרק צבעו משתנה — תצוגת הסטטוס בעמוד הראשי.
-    set_state("none"/"red"/"yellow"/"green") צובע את כל השטח בצבע הסמנטי המתאים.
+    מלבן רחב שצבעו וגם תוצאת השקילה (טקסט) שבתוכו משתנים — תצוגת הסטטוס
+    בעמוד הראשי. set_state("none"/"red"/"yellow"/"green", text=...) צובע את
+    כל השטח בצבע הסמנטי המתאים וכותב את text במרכזו.
     הצבע נקרא מ-theme בכל קריאה (לא נשמר כקבוע) כדי שיתעדכן נכון גם אם מצב
-    התצוגה (בהיר/כהה) מתחלף בזמן שהמלבן כבר צבוע.
+    התצוגה (בהיר/כהה) מתחלף בזמן שהמלבן כבר צבוע. צבע הטקסט עצמו קבוע לפי
+    מצב, לא לפי theme — צהוב (AMBER) הוא הרקע הבהיר ביותר משתי הפלטות (בהיר
+    וכהה), טקסט לבן עליו כמעט בלתי-קריא; טקסט שחור נבחר רק למצב הזה, לבן
+    לשלושת האחרים (ירוק/אדום/אפור-אין-מוצר — כולם כהים מספיק בשתי הפלטות).
     """
 
     def __init__(self, master, width=340, height=40, **kwargs):
         super().__init__(master, width=width, height=height,
                          background=theme.CARD_BG, highlightthickness=0, **kwargs)
         self._rect = self.create_rectangle(0, 0, width, height, outline="")
+        self._text_id = self.create_text(width / 2, height / 2, text="",
+                                         font=("TkDefaultFont", 13, "bold"))
         self._state = "none"
+        self._text = ""
         self.set_state("none")
 
     def _color_for(self, state: str) -> str:
         return {"red": theme.RED, "yellow": theme.AMBER,
                 "green": theme.GREEN}.get(state, theme.IDLE_GRAY)
 
-    def set_state(self, state: str):
+    def _text_color_for(self, state: str) -> str:
+        return "#000000" if state == "yellow" else "#ffffff"
+
+    def set_state(self, state: str, text: str = ""):
         self._state = state
+        self._text = text
         self.itemconfig(self._rect, fill=self._color_for(state))
+        self.itemconfig(self._text_id, text=text, fill=self._text_color_for(state))
 
     def refresh_theme(self):
-        """ מעדכן את צבע הרקע ומרנדר מחדש את המלבן בצבע העדכני של הפלטה. """
+        """ מעדכן את צבע הרקע ומרנדר מחדש את המלבן בצבע העדכני של הפלטה — עם
+        אותו טקסט שהיה מוצג, לא מאפס אותו. """
         self.configure(background=theme.CARD_BG)
-        self.set_state(self._state)
+        self.set_state(self._state, self._text)
 
 
 class StatusPill(tk.Frame):
